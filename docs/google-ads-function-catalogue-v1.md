@@ -2,7 +2,7 @@
 
 ## Scope
 
-This repository implements a standalone Google Ads Function Gateway for Catalogue v1 Phase A and read-only functions 01-06. It is a deterministic execution layer for future MCP, HTTP, CLI, cron, dashboard, and automation callers.
+This repository implements a standalone Google Ads Function Gateway for Catalogue v1 Phase A and read-only functions 01-06. It is a deterministic execution layer for MCP, HTTP, CLI, cron, dashboard, and automation callers.
 
 The MCP or AI layer may decide which approved function to call and may provide validated parameters. It must never provide raw GAQL, mutate Google Ads entities, or generate production Google Ads API logic at runtime.
 
@@ -10,7 +10,7 @@ The MCP or AI layer may decide which approved function to call and may provide v
 
 The implementation is a Python package under `src/google_ads_function_gateway`.
 
-- `config.py`: centralized settings for OAuth, login customer ID, API version, page size, retries, and customer allow-list.
+- `config.py`: centralized settings for OAuth, login customer ID, API version, retries, and customer allow-list.
 - `client/`: fakeable Google Ads client protocol plus the official `google-ads-python` adapter.
 - `auth/`: OAuth settings bridge.
 - `security/`: customer access-policy abstractions. The default production policy is allow-list based and deny-all when no allow-list is configured.
@@ -19,6 +19,7 @@ The implementation is a Python package under `src/google_ads_function_gateway`.
 - `dto/`: response-envelope and validation helpers.
 - `exceptions.py`: normalized public errors.
 - `log.py`: structured JSON logging with credential redaction.
+- `mcp_server.py`: stdio and Streamable HTTP MCP adapter for the approved read-only catalogue functions.
 
 ## Configuration
 
@@ -343,9 +344,9 @@ catalogue.invoke(
 )
 ```
 
-## Future MCP Invocation Rules
+## MCP Invocation Rules
 
-Future MCP clients should:
+MCP clients should:
 
 - Maintain an allow-list of function names exposed to the model.
 - Validate parameters before calling the gateway.
@@ -353,13 +354,27 @@ Future MCP clients should:
 - Preserve and forward `request_id` when available for traceability.
 - Display normalized `error` details to users, not raw Google Ads exceptions.
 
-Future MCP clients must never:
+MCP clients must never:
 
 - Supply raw GAQL.
 - Ask the model to generate GAQL for production execution.
 - Expose arbitrary report execution.
 - Expose write or mutation operations through this read-only catalogue.
 - Bypass the customer access policy.
+
+The stdio MCP server must be launched with a secret-free client configuration. Put only the executable, arguments, working directory if the client supports it, and non-secret runtime options in the MCP JSON. Google Ads developer tokens, OAuth client secrets, refresh tokens, and allow-list values remain in the ignored project-root `.env`.
+
+The MCP server uses the same `load_local_env()` mechanism as the CLI. It loads the ignored local `.env` from the project root before constructing the catalogue, so credentials do not need to be duplicated into the MCP client configuration.
+
+MCP stdio stdout is reserved for JSON-RPC protocol messages. Operational logs must go to stderr; the MCP entrypoint configures stdlib logging accordingly and must not print banners, debug output, or credential status messages to stdout.
+
+The same MCP server also supports Streamable HTTP at `/mcp` by running:
+
+```bash
+python -m google_ads_function_gateway.mcp_server --transport streamable-http
+```
+
+The Streamable HTTP transport uses the same registered MCP tool handlers as stdio. It must not add HTTP-specific GAQL, Google Ads API calls, authorization checks, or mutation operations. By default it binds to `127.0.0.1:8000`; `GOOGLE_ADS_MCP_AUTH_TOKEN` can enable a transport-level bearer-token gate for local personal use behind an HTTPS reverse proxy or tunnel.
 
 ## Implementation Status
 
@@ -378,6 +393,7 @@ Phase A:
 - DONE: Unit-test structure and skipped live integration-test structure.
 - DONE: CLI entrypoint for standardized function invocation.
 - DONE: Safe configuration doctor command.
+- DONE: Stdio and Streamable HTTP MCP server adapter for the approved read-only functions.
 
 Phase B:
 
@@ -415,5 +431,5 @@ Stage 1B API Compatibility Notes:
 Partial/TODO:
 
 - PARTIAL: Live Google Ads integration tests are scaffolded but skipped by default. They require real credentials, an allow-list, and `GOOGLE_ADS_RUN_LIVE_TESTS=1`.
-- TODO: Add an HTTP, cron, dashboard, MCP, or automation adapter when those surfaces are requested.
+- TODO: Add a cron, dashboard, or automation adapter when those surfaces are requested.
 - TODO: Add write/mutation functions only through a separate approved catalogue phase.

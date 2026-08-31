@@ -2,17 +2,17 @@
 
 Standalone, deterministic Google Ads function gateway for Google Ads Function Catalogue v1 Phase A and Phase B functions 01-06.
 
-The gateway is intentionally not an MCP conversational client. Future MCP clients should call approved function names with validated parameters; they must not supply raw GAQL or construct Google Ads API logic at runtime.
+The gateway includes a stdio MCP server adapter, but it is intentionally not an MCP conversational client. MCP clients should call approved function names with validated parameters; they must not supply raw GAQL or construct Google Ads API logic at runtime.
 
 ## Architecture Rules
 
 - No arbitrary GAQL endpoint.
-- No GAQL supplied by users, CLI callers, or future MCP clients.
+- No GAQL supplied by users, CLI callers, or MCP clients.
 - No runtime AI-generated Google Ads API code.
 - Google Ads queries remain predefined and version-controlled.
 - All reporting customer IDs require explicit authorization.
 - No mutation/write operations.
-- The CLI uses the same catalogue and function classes as future MCP, HTTP, cron, dashboard, and automation consumers.
+- The CLI and MCP server use the same catalogue and function classes as future HTTP, cron, dashboard, and automation consumers.
 
 ## Local Setup
 
@@ -138,6 +138,82 @@ python -m google_ads_function_gateway get-campaign-performance \
 
 Each command prints the normalized JSON envelope returned by the catalogue.
 
+## MCP Transports
+
+The MCP server exposes only the six existing read-only catalogue functions through both stdio and Streamable HTTP. Both transports use the same MCP server object, tool handlers, and Google Ads Function Catalogue. They do not add conversational routing, caller-supplied GAQL, direct HTTP Google Ads calls, or write operations.
+
+Install the project into the local virtual environment first:
+
+```bash
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+```
+
+### Local Stdio Mode
+
+Configure a local MCP client to launch the stdio server from the project root. The client configuration should contain only the executable, arguments, working directory if supported, and non-secret runtime options:
+
+```json
+{
+  "mcpServers": {
+    "google-ads-function-gateway": {
+      "command": "/absolute/path/to/google-ads-mcp-client/.venv/bin/python",
+      "args": ["-m", "google_ads_function_gateway.mcp_server"],
+      "cwd": "/absolute/path/to/google-ads-mcp-client"
+    }
+  }
+}
+```
+
+### Local Streamable HTTP Mode
+
+Start the Streamable HTTP MCP endpoint locally:
+
+```bash
+GOOGLE_ADS_MCP_HOST=127.0.0.1 GOOGLE_ADS_MCP_PORT=8000 \
+  python -m google_ads_function_gateway.mcp_server --transport streamable-http
+```
+
+Default endpoint:
+
+```text
+http://127.0.0.1:8000/mcp
+```
+
+The server defaults to `127.0.0.1` for safety. Set `GOOGLE_ADS_MCP_AUTH_TOKEN` to require `Authorization: Bearer ...` on HTTP MCP requests before using any HTTPS reverse proxy or tunnel.
+
+```bash
+GOOGLE_ADS_MCP_AUTH_TOKEN=replace-with-a-long-random-token \
+  python -m google_ads_function_gateway.mcp_server --transport streamable-http
+```
+
+Example local MCP protocol smoke test:
+
+```bash
+curl -i http://127.0.0.1:8000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-smoke","version":"0"}}}'
+```
+
+If bearer auth is enabled, add:
+
+```bash
+-H "Authorization: Bearer $GOOGLE_ADS_MCP_AUTH_TOKEN"
+```
+
+### Secret Handling
+
+Do not place `GOOGLE_ADS_DEVELOPER_TOKEN`, OAuth client secrets, refresh tokens, or any other Google Ads credentials in MCP client JSON or remote connector settings. The MCP server uses the same `load_local_env()` mechanism as the CLI and loads the ignored `.env` file from the project root.
+
+Google Ads credentials stay server-side and are never provided to ChatGPT. If you expose the Streamable HTTP endpoint through a secure tunnel or HTTPS reverse proxy, ChatGPT connects only to the MCP protocol endpoint and, when configured, presents the MCP bearer token.
+
+MCP stdio reserves stdout for JSON-RPC protocol messages. The MCP entrypoint does not print banners or debug output, and operational logging is configured for stderr.
+
+### Tunnel Compatibility
+
+The Streamable HTTP server is designed to sit behind a standard HTTPS reverse proxy or secure tunnel. Keep the local server bound to `127.0.0.1`, require `GOOGLE_ADS_MCP_AUTH_TOKEN`, expose the `/mcp` path over HTTPS, and ensure the proxy forwards request bodies and MCP headers unchanged. The application does not depend on a specific tunnel vendor.
+
 ## Configuration
 
 Supported environment variables:
@@ -151,6 +227,9 @@ Supported environment variables:
 - `GOOGLE_ADS_API_VERSION` optional; when omitted, the gateway uses the highest API version packaged by `google-ads-python`
 - `GOOGLE_ADS_RETRY_ATTEMPTS` optional, default `3`
 - `GOOGLE_ADS_RUN_LIVE_TESTS` optional; set to `1` only when intentionally running live read-only tests
+- `GOOGLE_ADS_MCP_HOST` optional Streamable HTTP bind host, default `127.0.0.1`
+- `GOOGLE_ADS_MCP_PORT` optional Streamable HTTP bind port, default `8000`
+- `GOOGLE_ADS_MCP_AUTH_TOKEN` optional bearer token for Streamable HTTP MCP requests
 
 ## Development Checks
 

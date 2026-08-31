@@ -12,6 +12,7 @@ license = { text = "Proprietary" }
 authors = [{ name = "Google Ads MCP Client maintainers" }]
 dependencies = [
     "google-ads",
+    "mcp>=2.1.1,<3",
     "python-dotenv>=1.0.0",
 ]
 
@@ -20,6 +21,7 @@ dev = ["ruff>=0.8.0"]
 
 [project.scripts]
 google-ads-function-gateway = "google_ads_function_gateway.cli:main"
+google-ads-function-gateway-mcp = "google_ads_function_gateway.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
