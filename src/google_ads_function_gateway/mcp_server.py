@@ -21,6 +21,7 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from starlette.requests import Request
+from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from google_ads_function_gateway.catalogue import GoogleAdsFunctionCatalogue
@@ -149,18 +150,23 @@ class BearerTokenAuthMiddleware:
 
 
 class HostOriginSecurityMiddleware:
-    """Apply MCP SDK Host/Origin checks to every HTTP route on the app."""
+    """Validate Host globally and apply MCP Origin checks only to the MCP route."""
 
-    def __init__(self, app: ASGIApp, settings: TransportSecuritySettings) -> None:
+    def __init__(self, app: ASGIApp, settings: TransportSecuritySettings, mcp_path: str) -> None:
         self.app = app
+        self._settings = settings
         self._security = TransportSecurityMiddleware(settings)
+        self._mcp_path = mcp_path
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        response = await self._security.validate_request(Request(scope, receive), is_post=False)
+        if scope.get("path") == self._mcp_path:
+            response = await self._security.validate_request(Request(scope, receive), is_post=False)
+        else:
+            response = _validate_host_header(scope, self._settings)
         if response is not None:
             await response(scope, receive, send)
             return
@@ -500,7 +506,7 @@ def build_streamable_http_app(
     if settings.auth_mode == OAUTH_AUTH_MODE and oauth_server is not None:
         app = OptionalOAuthContextMiddleware(app, oauth_server)
         app = EmptyMcpPostProbeMiddleware(app, settings.path, oauth_server)
-    app = HostOriginSecurityMiddleware(app, transport_security)
+    app = HostOriginSecurityMiddleware(app, transport_security, settings.path)
     if settings.http_diagnostics:
         app = HttpDiagnosticsMiddleware(app)
     return app
@@ -826,6 +832,39 @@ def _content_length_is_zero(scope: Scope) -> bool:
         return int(content_length.decode("ascii").strip()) == 0
     except ValueError:
         return False
+
+
+def _validate_host_header(
+    scope: Scope,
+    settings: TransportSecuritySettings,
+) -> Response | None:
+    if not settings.enable_dns_rebinding_protection:
+        return None
+
+    host = _header_text(scope, b"host")
+    if host is not None and _host_is_allowed(host, settings.allowed_hosts):
+        return None
+
+    logging.getLogger("mcp.server.transport_security").warning(
+        "Missing Host header in request" if not host else f"Invalid Host header: {host}"
+    )
+    return Response("Invalid Host header", status_code=421)
+
+
+def _host_is_allowed(host: str, allowed_hosts: list[str]) -> bool:
+    if host in allowed_hosts:
+        return True
+    return any(
+        allowed.endswith(":*") and host.startswith(f"{allowed[:-2]}:")
+        for allowed in allowed_hosts
+    )
+
+
+def _header_text(scope: Scope, name: bytes) -> str | None:
+    value = _header_value(scope, name)
+    if value is None:
+        return None
+    return value.decode("latin-1", errors="replace")
 
 
 def _bearer_token_from_scope(scope: Scope) -> str | None:

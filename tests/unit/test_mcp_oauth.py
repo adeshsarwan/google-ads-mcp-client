@@ -253,6 +253,105 @@ class McpOAuthTests(unittest.TestCase):
         self.assertNotIn("unit-state", joined)
         self.assertNotIn(registered["client_id"], joined)
 
+    def test_oauth_owner_form_posts_allow_null_origin_with_valid_state(self) -> None:
+        app, _, _ = self._build_oauth_app()
+
+        with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
+            registered = _register_client(client)
+            authorize = _authorization_request(client, registered["client_id"])
+            request_id = _query_value(authorize.headers["location"], "request")
+            login_page = client.get(authorize.headers["location"], headers={"Host": PUBLIC_HOST})
+            login = client.post(
+                "/oauth/owner/login",
+                data={
+                    "request": request_id,
+                    "csrf_token": _csrf_token(login_page.text),
+                    "username": OWNER_USERNAME,
+                    "password": OWNER_PASSWORD,
+                },
+                headers={"Host": PUBLIC_HOST, "Origin": "null"},
+                follow_redirects=False,
+            )
+            approval_page = client.get(login.headers["location"], headers={"Host": PUBLIC_HOST})
+            approval = client.post(
+                "/oauth/owner/approve",
+                data={
+                    "request": request_id,
+                    "csrf_token": _csrf_token(approval_page.text),
+                    "decision": "approve",
+                },
+                headers={"Host": PUBLIC_HOST, "Origin": "null"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(authorize.status_code, 302)
+        self.assertEqual(login_page.status_code, 200)
+        self.assertEqual(login.status_code, 302)
+        self.assertTrue(login.headers["location"].startswith("/oauth/owner/approve"))
+        self.assertEqual(approval.status_code, 302)
+        self.assertTrue(approval.headers["location"].startswith(REDIRECT_URI))
+        self.assertEqual(_query_value(approval.headers["location"], "state"), "unit-state")
+        self.assertEqual(_query_value(approval.headers["location"], "iss"), PUBLIC_ORIGIN)
+
+    def test_oauth_and_metadata_routes_reject_hostile_host_without_origin_policy(self) -> None:
+        app, _, _ = self._build_oauth_app()
+
+        with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
+            responses = {
+                "protected_resource": client.get(
+                    f"{PROTECTED_RESOURCE_METADATA_PATH}/mcp",
+                    headers={"Host": "attacker.example.com"},
+                ),
+                "authorization_server": client.get(
+                    AUTHORIZATION_SERVER_METADATA_PATH,
+                    headers={"Host": "attacker.example.com"},
+                ),
+                "register": client.post(
+                    "/oauth/register",
+                    json={"redirect_uris": [REDIRECT_URI], "scope": READ_SCOPE},
+                    headers={"Host": "attacker.example.com"},
+                ),
+                "authorize": client.get(
+                    "/oauth/authorize",
+                    params={
+                        "response_type": "code",
+                        "client_id": "missing-client",
+                        "redirect_uri": REDIRECT_URI,
+                        "scope": READ_SCOPE,
+                        "state": "unit-state",
+                        "code_challenge": _pkce_s256("valid-verifier"),
+                        "code_challenge_method": "S256",
+                        "resource": RESOURCE_URL,
+                    },
+                    headers={"Host": "attacker.example.com"},
+                ),
+                "owner_login": client.post(
+                    "/oauth/owner/login",
+                    data={},
+                    headers={"Host": "attacker.example.com", "Origin": "null"},
+                ),
+                "owner_approve": client.post(
+                    "/oauth/owner/approve",
+                    data={},
+                    headers={"Host": "attacker.example.com", "Origin": "null"},
+                ),
+                "token": client.post(
+                    "/oauth/token",
+                    data={},
+                    headers={"Host": "attacker.example.com"},
+                ),
+                "revoke": client.post(
+                    "/oauth/revoke",
+                    data={},
+                    headers={"Host": "attacker.example.com"},
+                ),
+            }
+
+        self.assertEqual(
+            {name: response.status_code for name, response in responses.items()},
+            {name: 421 for name in responses},
+        )
+
     def test_authorization_code_pkce_exchange_and_refresh_rotation(self) -> None:
         app, oauth_server, _ = self._build_oauth_app()
 
@@ -717,6 +816,12 @@ class McpOAuthTests(unittest.TestCase):
                 initialize_body,
                 403,
             ),
+            (
+                "null_origin",
+                {"Accept": "application/json, text/event-stream", "Origin": "null"},
+                initialize_body,
+                403,
+            ),
         ]
 
         with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
@@ -816,6 +921,10 @@ class McpOAuthTests(unittest.TestCase):
                     client,
                     extra_headers={"MCP-Protocol-Version": "2025-06-18"},
                 ),
+                "empty_with_null_origin": _chatgpt_empty_probe(
+                    client,
+                    extra_headers={"Origin": "null"},
+                ),
                 "malformed_json": client.post(
                     "/mcp",
                     headers={
@@ -862,6 +971,7 @@ class McpOAuthTests(unittest.TestCase):
                 "empty_with_authorization": 400,
                 "empty_with_session": 404,
                 "empty_with_protocol": 400,
+                "empty_with_null_origin": 403,
                 "malformed_json": 400,
                 "json_array_batch": 400,
                 "non_empty_octet_stream": 400,
@@ -994,21 +1104,7 @@ def _register_client(client: TestClient) -> dict[str, Any]:
 
 def _authorize_owner(client: TestClient, *, client_id: str, scope: str) -> dict[str, str]:
     verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~abc"
-    response = client.get(
-        "/oauth/authorize",
-        params={
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": REDIRECT_URI,
-            "scope": scope,
-            "state": "unit-state",
-            "code_challenge": _pkce_s256(verifier),
-            "code_challenge_method": "S256",
-            "resource": RESOURCE_URL,
-        },
-        headers={"Host": PUBLIC_HOST},
-        follow_redirects=False,
-    )
+    response = _authorization_request(client, client_id, scope=scope, verifier=verifier)
     if response.status_code != 302:
         raise AssertionError(response.text)
     request_id = _query_value(response.headers["location"], "request")
@@ -1049,6 +1145,30 @@ def _authorize_owner(client: TestClient, *, client_id: str, scope: str) -> dict[
         "iss": _query_value(location, "iss"),
         "verifier": verifier,
     }
+
+
+def _authorization_request(
+    client: TestClient,
+    client_id: str,
+    *,
+    scope: str = f"{READ_SCOPE} {OFFLINE_ACCESS_SCOPE}",
+    verifier: str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~abc",
+) -> Any:
+    return client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": REDIRECT_URI,
+            "scope": scope,
+            "state": "unit-state",
+            "code_challenge": _pkce_s256(verifier),
+            "code_challenge_method": "S256",
+            "resource": RESOURCE_URL,
+        },
+        headers={"Host": PUBLIC_HOST},
+        follow_redirects=False,
+    )
 
 
 def _exchange_authorization_code(

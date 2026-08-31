@@ -251,6 +251,11 @@ OAuth owner approval happens on server-hosted login and approval pages. The pass
 stored in `.env` must be an Argon2id hash in `GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH`;
 do not put a plaintext owner password in `.env`.
 
+The MCP transport endpoint keeps the SDK Host/Origin/DNS-rebinding checks. OAuth
+metadata and browser authorization routes keep exact Host allowlisting but do not
+inherit the MCP transport Origin rule; they are protected by OAuth request state,
+exact redirect URI matching, PKCE, CSRF tokens, and owner-session cookies.
+
 For a local protocol-only smoke test without OAuth, explicitly choose the fallback
 mode:
 

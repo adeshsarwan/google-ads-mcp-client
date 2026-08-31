@@ -130,6 +130,12 @@ tool definitions must be visible without exposing Google Ads data. Google Ads
 catalogue execution still requires a valid MCP OAuth token and preserves the
 existing customer allow-list.
 
+The MCP transport endpoint keeps the SDK Host/Origin/DNS-rebinding checks. OAuth
+metadata and browser authorization endpoints validate the exact Host allowlist but
+do not inherit the MCP transport Origin rule; they rely on OAuth request state,
+exact redirect URI matching, PKCE, CSRF tokens, and owner-session cookies for the
+browser form flow.
+
 Some ChatGPT Business discovery runs first send an unauthenticated empty
 `POST /mcp` reachability probe with `Content-Length: 0`. This service answers
 only that exact empty probe with `401 Unauthorized` and a `WWW-Authenticate`
