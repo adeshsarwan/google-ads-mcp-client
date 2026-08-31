@@ -11,9 +11,11 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import mcp_types as mcp_types
 from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from google_ads_function_gateway.catalogue import GoogleAdsFunctionCatalogue
@@ -23,6 +25,7 @@ SERVER_NAME = "google-ads-function-gateway"
 DEFAULT_STREAMABLE_HTTP_HOST = "127.0.0.1"
 DEFAULT_STREAMABLE_HTTP_PORT = 8000
 DEFAULT_STREAMABLE_HTTP_PATH = "/mcp"
+GOOGLE_ADS_MCP_PUBLIC_HOST_ENV_VAR = "GOOGLE_ADS_MCP_PUBLIC_HOST"
 SUPPORTED_TRANSPORTS = ("stdio", "streamable-http")
 
 READ_ONLY_TOOL_ANNOTATIONS = mcp_types.ToolAnnotations(
@@ -40,6 +43,7 @@ class McpRuntimeSettings:
     port: int = DEFAULT_STREAMABLE_HTTP_PORT
     path: str = DEFAULT_STREAMABLE_HTTP_PATH
     auth_token: str | None = None
+    public_host: str | None = None
 
     @classmethod
     def from_env(
@@ -56,11 +60,15 @@ class McpRuntimeSettings:
             port=port or _port_from_env(),
             path=_normalize_http_path(path or DEFAULT_STREAMABLE_HTTP_PATH),
             auth_token=_optional_env("GOOGLE_ADS_MCP_AUTH_TOKEN"),
+            public_host=_normalize_public_host(_optional_env(GOOGLE_ADS_MCP_PUBLIC_HOST_ENV_VAR)),
         )
 
     @property
     def endpoint_url(self) -> str:
         return f"http://{self.host}:{self.port}{self.path}"
+
+    def transport_security_settings(self) -> TransportSecuritySettings:
+        return build_transport_security_settings(public_host=self.public_host, port=self.port)
 
 
 class BearerTokenAuthMiddleware:
@@ -276,6 +284,7 @@ def build_streamable_http_app(
     app = server.streamable_http_app(
         streamable_http_path=settings.path,
         host=settings.host,
+        transport_security=settings.transport_security_settings(),
     )
     if settings.auth_token:
         return BearerTokenAuthMiddleware(app, settings.auth_token)
@@ -349,6 +358,55 @@ def _port_from_env() -> int:
 def _normalize_http_path(path: str) -> str:
     normalized = path.strip() or DEFAULT_STREAMABLE_HTTP_PATH
     return normalized if normalized.startswith("/") else f"/{normalized}"
+
+
+def build_transport_security_settings(
+    *,
+    public_host: str | None,
+    port: int,
+) -> TransportSecuritySettings:
+    allowed_hosts = [
+        "127.0.0.1",
+        f"127.0.0.1:{port}",
+        "localhost",
+        f"localhost:{port}",
+    ]
+    allowed_origins = [
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+    ]
+
+    if public_host:
+        allowed_hosts.extend(
+            [
+                public_host,
+                f"{public_host}:443",
+                f"{public_host}:*",
+            ]
+        )
+        allowed_origins.append(f"https://{public_host}")
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_deduplicate(allowed_hosts),
+        allowed_origins=_deduplicate(allowed_origins),
+    )
+
+
+def _normalize_public_host(value: str | None) -> str | None:
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw if "://" in raw else f"//{raw}")
+    if not parsed.hostname:
+        return None
+    return parsed.hostname.lower()
+
+
+def _deduplicate(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
 
 
 def _optional_env(name: str) -> str | None:

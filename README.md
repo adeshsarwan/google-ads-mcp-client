@@ -214,6 +214,20 @@ MCP stdio reserves stdout for JSON-RPC protocol messages. The MCP entrypoint doe
 
 The Streamable HTTP server is designed to sit behind a standard HTTPS reverse proxy or secure tunnel. Keep the local server bound to `127.0.0.1`, require `GOOGLE_ADS_MCP_AUTH_TOKEN`, expose the `/mcp` path over HTTPS, and ensure the proxy forwards request bodies and MCP headers unchanged. The application does not depend on a specific tunnel vendor.
 
+The MCP Python SDK keeps DNS-rebinding protection enabled for Streamable HTTP. When deploying behind Cloudflare Tunnel or another HTTPS reverse proxy, set the public hostname so the forwarded `Host` header is explicitly allowed:
+
+```dotenv
+GOOGLE_ADS_MCP_PUBLIC_HOST=googleads-mcp.thebesads.com
+```
+
+Current production MCP endpoint:
+
+```text
+https://googleads-mcp.thebesads.com/mcp
+```
+
+The production origin allowlist is limited to `https://googleads-mcp.thebesads.com` when an `Origin` header is present.
+
 ## Configuration
 
 Supported environment variables:
@@ -229,6 +243,7 @@ Supported environment variables:
 - `GOOGLE_ADS_RUN_LIVE_TESTS` optional; set to `1` only when intentionally running live read-only tests
 - `GOOGLE_ADS_MCP_HOST` optional Streamable HTTP bind host, default `127.0.0.1`
 - `GOOGLE_ADS_MCP_PORT` optional Streamable HTTP bind port, default `8000`
+- `GOOGLE_ADS_MCP_PUBLIC_HOST` optional public HTTPS tunnel or reverse-proxy hostname allowed by MCP DNS-rebinding protection
 - `GOOGLE_ADS_MCP_AUTH_TOKEN` optional bearer token for Streamable HTTP MCP requests
 
 ## Development Checks
