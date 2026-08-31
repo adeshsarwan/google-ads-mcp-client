@@ -167,7 +167,34 @@ Configure a local MCP client to launch the stdio server from the project root. T
 
 ### Local Streamable HTTP Mode
 
-Start the Streamable HTTP MCP endpoint locally:
+Streamable HTTP uses OAuth by default because it is the remote-capable mode intended
+for ChatGPT Custom Apps. Set the OAuth environment in the server-side `.env` first:
+
+```dotenv
+GOOGLE_ADS_MCP_AUTH_MODE=oauth
+GOOGLE_ADS_MCP_PUBLIC_HOST=googleads-mcp.thebesads.com
+GOOGLE_ADS_MCP_PUBLIC_ORIGIN=https://googleads-mcp.thebesads.com
+GOOGLE_ADS_MCP_OAUTH_DB=/var/lib/google-ads-mcp/oauth.db
+GOOGLE_ADS_MCP_OWNER_USERNAME=replace-me
+GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH=replace-with-argon2id-hash
+GOOGLE_ADS_MCP_OAUTH_SECRET=replace-with-at-least-32-random-chars
+GOOGLE_ADS_MCP_ACCESS_TOKEN_TTL_SECONDS=3600
+GOOGLE_ADS_MCP_AUTH_CODE_TTL_SECONDS=300
+GOOGLE_ADS_MCP_REFRESH_TOKEN_TTL_SECONDS=2592000
+```
+
+Generate the owner password hash locally without printing the plaintext password:
+
+```bash
+python - <<'PY'
+from argon2 import PasswordHasher
+from getpass import getpass
+
+print(PasswordHasher().hash(getpass("Owner password: ")))
+PY
+```
+
+Start the Streamable HTTP MCP endpoint:
 
 ```bash
 GOOGLE_ADS_MCP_HOST=127.0.0.1 GOOGLE_ADS_MCP_PORT=8000 \
@@ -180,14 +207,40 @@ Default endpoint:
 http://127.0.0.1:8000/mcp
 ```
 
-The server defaults to `127.0.0.1` for safety. Set `GOOGLE_ADS_MCP_AUTH_TOKEN` to require `Authorization: Bearer ...` on HTTP MCP requests before using any HTTPS reverse proxy or tunnel.
+The server defaults to `127.0.0.1` for safety. OAuth discovery endpoints are exposed
+by the same process:
+
+```text
+https://googleads-mcp.thebesads.com/.well-known/oauth-protected-resource/mcp
+https://googleads-mcp.thebesads.com/.well-known/oauth-authorization-server
+https://googleads-mcp.thebesads.com/oauth/authorize
+https://googleads-mcp.thebesads.com/oauth/token
+https://googleads-mcp.thebesads.com/oauth/register
+https://googleads-mcp.thebesads.com/oauth/revoke
+```
+
+The OAuth server supports authorization code with PKCE S256 and refresh-token grant.
+It does not support the implicit grant. The MCP resource scope is:
+
+```text
+google_ads.read
+```
+
+`offline_access` may be requested when the client needs refresh tokens.
+
+OAuth owner approval happens on server-hosted login and approval pages. The password
+stored in `.env` must be an Argon2id hash in `GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH`;
+do not put a plaintext owner password in `.env`.
+
+For a local protocol-only smoke test without OAuth, explicitly choose the fallback
+mode:
 
 ```bash
-GOOGLE_ADS_MCP_AUTH_TOKEN=replace-with-a-long-random-token \
+GOOGLE_ADS_MCP_AUTH_MODE=static_bearer \
   python -m google_ads_function_gateway.mcp_server --transport streamable-http
 ```
 
-Example local MCP protocol smoke test:
+Example local MCP protocol smoke test in fallback mode:
 
 ```bash
 curl -i http://127.0.0.1:8000/mcp \
@@ -196,23 +249,32 @@ curl -i http://127.0.0.1:8000/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-smoke","version":"0"}}}'
 ```
 
-If bearer auth is enabled, add:
+To use the legacy static bearer fallback, set both:
+
+```dotenv
+GOOGLE_ADS_MCP_AUTH_MODE=static_bearer
+GOOGLE_ADS_MCP_AUTH_TOKEN=replace-with-a-long-random-token
+```
+
+Then add this header to MCP requests:
 
 ```bash
 -H "Authorization: Bearer $GOOGLE_ADS_MCP_AUTH_TOKEN"
 ```
 
+OAuth mode ignores `GOOGLE_ADS_MCP_AUTH_TOKEN`.
+
 ### Secret Handling
 
 Do not place `GOOGLE_ADS_DEVELOPER_TOKEN`, OAuth client secrets, refresh tokens, or any other Google Ads credentials in MCP client JSON or remote connector settings. The MCP server uses the same `load_local_env()` mechanism as the CLI and loads the ignored `.env` file from the project root.
 
-Google Ads credentials stay server-side and are never provided to ChatGPT. If you expose the Streamable HTTP endpoint through a secure tunnel or HTTPS reverse proxy, ChatGPT connects only to the MCP protocol endpoint and, when configured, presents the MCP bearer token.
+Google Ads credentials stay server-side and are never provided to ChatGPT. If you expose the Streamable HTTP endpoint through a secure tunnel or HTTPS reverse proxy, ChatGPT connects only to the MCP protocol endpoint and completes OAuth with this MCP service.
 
 MCP stdio reserves stdout for JSON-RPC protocol messages. The MCP entrypoint does not print banners or debug output, and operational logging is configured for stderr.
 
 ### Tunnel Compatibility
 
-The Streamable HTTP server is designed to sit behind a standard HTTPS reverse proxy or secure tunnel. Keep the local server bound to `127.0.0.1`, require `GOOGLE_ADS_MCP_AUTH_TOKEN`, expose the `/mcp` path over HTTPS, and ensure the proxy forwards request bodies and MCP headers unchanged. The application does not depend on a specific tunnel vendor.
+The Streamable HTTP server is designed to sit behind a standard HTTPS reverse proxy or secure tunnel. Keep the local server bound to `127.0.0.1`, expose the MCP and OAuth paths over HTTPS, and ensure the proxy forwards request bodies and MCP headers unchanged. The application does not depend on a specific tunnel vendor.
 
 The MCP Python SDK keeps DNS-rebinding protection enabled for Streamable HTTP. When deploying behind Cloudflare Tunnel or another HTTPS reverse proxy, set the public hostname so the forwarded `Host` header is explicitly allowed:
 
@@ -227,6 +289,19 @@ https://googleads-mcp.thebesads.com/mcp
 ```
 
 The production origin allowlist is limited to `https://googleads-mcp.thebesads.com` when an `Origin` header is present.
+
+For ChatGPT Business Custom Apps, configure:
+
+- MCP server URL: `https://googleads-mcp.thebesads.com/mcp`
+- Authentication: OAuth
+- Scopes: `google_ads.read offline_access`
+
+ChatGPT receives OAuth access and refresh tokens for this MCP server only. It does
+not receive the Google Ads developer token, Google OAuth client secret, Google Ads
+refresh token, or any other server-side Google Ads credential.
+
+Dynamic client registration is enabled so ChatGPT can register its exact redirect
+URI and use PKCE S256 during account linking.
 
 ## Configuration
 
@@ -244,7 +319,16 @@ Supported environment variables:
 - `GOOGLE_ADS_MCP_HOST` optional Streamable HTTP bind host, default `127.0.0.1`
 - `GOOGLE_ADS_MCP_PORT` optional Streamable HTTP bind port, default `8000`
 - `GOOGLE_ADS_MCP_PUBLIC_HOST` optional public HTTPS tunnel or reverse-proxy hostname allowed by MCP DNS-rebinding protection
-- `GOOGLE_ADS_MCP_AUTH_TOKEN` optional bearer token for Streamable HTTP MCP requests
+- `GOOGLE_ADS_MCP_PUBLIC_ORIGIN` optional explicit OAuth issuer/origin; defaults to `https://GOOGLE_ADS_MCP_PUBLIC_HOST` when a public host is configured
+- `GOOGLE_ADS_MCP_AUTH_MODE` optional Streamable HTTP auth mode, default `oauth`; set to `static_bearer` only for the legacy bearer-token fallback
+- `GOOGLE_ADS_MCP_OAUTH_DB` SQLite OAuth persistence path, default `/var/lib/google-ads-mcp/oauth.db`
+- `GOOGLE_ADS_MCP_OWNER_USERNAME` OAuth owner approval username
+- `GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH` Argon2id hash for the OAuth owner approval password
+- `GOOGLE_ADS_MCP_ACCESS_TOKEN_TTL_SECONDS` OAuth access-token lifetime, default `3600`
+- `GOOGLE_ADS_MCP_AUTH_CODE_TTL_SECONDS` OAuth authorization-code lifetime, default `300`
+- `GOOGLE_ADS_MCP_REFRESH_TOKEN_TTL_SECONDS` OAuth refresh-token lifetime, default `2592000`
+- `GOOGLE_ADS_MCP_OAUTH_SECRET` server-side HMAC secret for hashing OAuth tokens, authorization codes, client secrets, and owner sessions at rest
+- `GOOGLE_ADS_MCP_AUTH_TOKEN` optional bearer token used only when `GOOGLE_ADS_MCP_AUTH_MODE=static_bearer`
 
 ## Development Checks
 

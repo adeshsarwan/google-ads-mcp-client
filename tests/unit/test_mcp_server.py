@@ -16,6 +16,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from google_ads_function_gateway.mcp_server import (
+    STATIC_BEARER_AUTH_MODE,
     BearerTokenAuthMiddleware,
     McpRuntimeSettings,
     build_mcp_server,
@@ -54,6 +55,22 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(fake_server.run_calls, ["stdio"])
 
+    def test_stdio_transport_ignores_http_auth_mode_configuration(self) -> None:
+        fake_server = _FakeServer()
+
+        with patch.dict(os.environ, {"GOOGLE_ADS_MCP_AUTH_MODE": "not-valid"}), patch(
+            "google_ads_function_gateway.mcp_server.load_local_env"
+        ), patch(
+            "google_ads_function_gateway.mcp_server.build_mcp_server",
+            return_value=fake_server,
+        ), contextlib.redirect_stdout(
+            StringIO()
+        ):
+            exit_code = main([])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(fake_server.run_calls, ["stdio"])
+
     def test_main_starts_streamable_http_transport_from_env(self) -> None:
         fake_server = _FakeServer()
         env = {
@@ -61,6 +78,7 @@ class McpServerTests(unittest.TestCase):
             "GOOGLE_ADS_MCP_PORT": "8765",
             "GOOGLE_ADS_MCP_AUTH_TOKEN": "unit-test-token",
             "GOOGLE_ADS_MCP_PUBLIC_HOST": "https://googleads-mcp.thebesads.com/mcp",
+            "GOOGLE_ADS_MCP_AUTH_MODE": STATIC_BEARER_AUTH_MODE,
         }
 
         with patch.dict(os.environ, env), patch(
@@ -85,6 +103,7 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(settings.port, 8765)
         self.assertEqual(settings.path, "/mcp")
         self.assertEqual(settings.public_host, "googleads-mcp.thebesads.com")
+        self.assertEqual(settings.auth_mode, STATIC_BEARER_AUTH_MODE)
         self.assertEqual(settings.endpoint_url, "http://127.0.0.1:8765/mcp")
 
     def test_transport_security_settings_allow_localhost_and_public_host(self) -> None:
@@ -157,11 +176,17 @@ class McpServerTests(unittest.TestCase):
         before = sorted(tool.name for tool in server._tool_manager.list_tools())
         app = build_streamable_http_app(
             server,
-            McpRuntimeSettings(transport="streamable-http"),
+            McpRuntimeSettings(
+                transport="streamable-http",
+                auth_mode=STATIC_BEARER_AUTH_MODE,
+            ),
         )
 
         with TestClient(app) as client:
-            self.assertEqual(client.get("/not-found").status_code, 404)
+            self.assertEqual(
+                client.get("/not-found", headers={"Host": "localhost:8000"}).status_code,
+                404,
+            )
 
         self.assertEqual(before, EXPECTED_TOOLS)
         self.assertEqual(
@@ -415,6 +440,7 @@ def _http_mcp_app(
             port=port,
             auth_token=auth_token,
             public_host=public_host,
+            auth_mode=STATIC_BEARER_AUTH_MODE,
         ),
     )
 

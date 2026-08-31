@@ -374,7 +374,31 @@ The same MCP server also supports Streamable HTTP at `/mcp` by running:
 python -m google_ads_function_gateway.mcp_server --transport streamable-http
 ```
 
-The Streamable HTTP transport uses the same registered MCP tool handlers as stdio. It must not add HTTP-specific GAQL, Google Ads API calls, authorization checks, or mutation operations. By default it binds to `127.0.0.1:8000`; `GOOGLE_ADS_MCP_AUTH_TOKEN` can enable a transport-level bearer-token gate for local personal use behind an HTTPS reverse proxy or tunnel.
+The Streamable HTTP transport uses the same registered MCP tool handlers as stdio.
+It must not add HTTP-specific GAQL, Google Ads API calls, catalogue authorization
+checks, or mutation operations. By default it binds to `127.0.0.1:8000`.
+
+Remote Streamable HTTP defaults to OAuth for ChatGPT and other MCP clients:
+
+```dotenv
+GOOGLE_ADS_MCP_AUTH_MODE=oauth
+GOOGLE_ADS_MCP_PUBLIC_HOST=googleads-mcp.thebesads.com
+GOOGLE_ADS_MCP_PUBLIC_ORIGIN=https://googleads-mcp.thebesads.com
+GOOGLE_ADS_MCP_OAUTH_DB=/var/lib/google-ads-mcp/oauth.db
+GOOGLE_ADS_MCP_OWNER_USERNAME=replace-me
+GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH=replace-with-argon2id-hash
+GOOGLE_ADS_MCP_OAUTH_SECRET=replace-with-at-least-32-random-chars
+```
+
+The MCP OAuth layer exposes authorization code with PKCE S256, refresh-token grant,
+dynamic client registration, token revocation, protected-resource metadata, and
+authorization-server metadata. The only MCP resource scope is `google_ads.read`;
+`offline_access` may be requested for refresh tokens. This OAuth layer authorizes
+access to the MCP service only. It does not alter the Google Ads OAuth credentials,
+Google Ads refresh token, fixed GAQL, or customer allow-list behavior.
+
+For legacy local testing, `GOOGLE_ADS_MCP_AUTH_MODE=static_bearer` can enable the
+older `GOOGLE_ADS_MCP_AUTH_TOKEN` transport gate. OAuth mode ignores that token.
 
 ## Implementation Status
 

@@ -64,11 +64,74 @@ http://127.0.0.1:8000/mcp
 
 The server binds to `127.0.0.1` by default. Do not bind to a public interface unless a deliberate deployment layer is handling HTTPS, authentication, and access control.
 
-## Optional Bearer Token
+## OAuth For Remote MCP Clients
+
+Streamable HTTP defaults to OAuth for remote clients such as ChatGPT Custom Apps:
+
+```dotenv
+GOOGLE_ADS_MCP_AUTH_MODE=oauth
+GOOGLE_ADS_MCP_PUBLIC_HOST=googleads-mcp.thebesads.com
+GOOGLE_ADS_MCP_PUBLIC_ORIGIN=https://googleads-mcp.thebesads.com
+GOOGLE_ADS_MCP_OAUTH_DB=/var/lib/google-ads-mcp/oauth.db
+GOOGLE_ADS_MCP_OWNER_USERNAME=replace-me
+GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH=replace-with-argon2id-hash
+GOOGLE_ADS_MCP_OAUTH_SECRET=replace-with-at-least-32-random-chars
+GOOGLE_ADS_MCP_ACCESS_TOKEN_TTL_SECONDS=3600
+GOOGLE_ADS_MCP_AUTH_CODE_TTL_SECONDS=300
+GOOGLE_ADS_MCP_REFRESH_TOKEN_TTL_SECONDS=2592000
+```
+
+Generate the owner password hash with Argon2id:
+
+```bash
+python - <<'PY'
+from argon2 import PasswordHasher
+from getpass import getpass
+
+print(PasswordHasher().hash(getpass("Owner password: ")))
+PY
+```
+
+The OAuth implementation is for ChatGPT-to-this-MCP-service authorization only.
+It does not replace or modify Google Ads OAuth, the Google Ads refresh token, or any
+Google Ads API authentication path.
+
+Supported OAuth behavior:
+
+- authorization code grant with PKCE S256
+- refresh-token grant
+- dynamic client registration at `/oauth/register`
+- token revocation at `/oauth/revoke`
+- protected resource metadata at `/.well-known/oauth-protected-resource/mcp`
+- authorization server metadata at `/.well-known/oauth-authorization-server`
+- MCP resource scope `google_ads.read`
+- optional `offline_access` for refresh tokens
+
+Unsupported OAuth behavior:
+
+- implicit grant
+- caller-supplied Google Ads credentials
+- Google Ads mutation/write scopes
+- arbitrary scopes beyond `google_ads.read` and `offline_access`
+
+The owner approval flow uses server-hosted login and approval pages. The owner
+password is never stored in plaintext; `.env` must contain only the Argon2id hash.
+OAuth tokens, authorization codes, owner sessions, and confidential-client secrets
+are stored hashed in SQLite.
+
+## Static Bearer Fallback
+
+The old bearer-token transport gate remains available only as an explicit fallback:
+
+```dotenv
+GOOGLE_ADS_MCP_AUTH_MODE=static_bearer
+GOOGLE_ADS_MCP_AUTH_TOKEN=replace-with-a-long-random-token
+```
 
 Set `GOOGLE_ADS_MCP_AUTH_TOKEN` to require a bearer token for Streamable HTTP requests:
 
 ```bash
+GOOGLE_ADS_MCP_AUTH_MODE=static_bearer \
 GOOGLE_ADS_MCP_AUTH_TOKEN=replace-with-a-long-random-token \
   python -m google_ads_function_gateway.mcp_server --transport streamable-http
 ```
@@ -79,11 +142,11 @@ Clients must then send:
 Authorization: Bearer <GOOGLE_ADS_MCP_AUTH_TOKEN>
 ```
 
-The token is checked at the HTTP transport layer before MCP tool execution. It is never passed into individual tools and is never logged.
+The token is checked at the HTTP transport layer before MCP tool execution. It is never passed into individual tools and is never logged. OAuth mode ignores `GOOGLE_ADS_MCP_AUTH_TOKEN`.
 
-## Smoke Test
+## Smoke Tests
 
-Without bearer auth:
+For static-bearer fallback without a token:
 
 ```bash
 curl -i http://127.0.0.1:8000/mcp \
@@ -92,7 +155,17 @@ curl -i http://127.0.0.1:8000/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-smoke","version":"0"}}}'
 ```
 
-With bearer auth:
+For OAuth mode, an unauthenticated request should return `401` and a
+`WWW-Authenticate` challenge containing OAuth protected-resource metadata:
+
+```bash
+curl -i https://googleads-mcp.thebesads.com/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"oauth-smoke","version":"0"}}}'
+```
+
+With static bearer auth:
 
 ```bash
 curl -i http://127.0.0.1:8000/mcp \
@@ -104,15 +177,18 @@ curl -i http://127.0.0.1:8000/mcp \
 
 ## ChatGPT Via HTTPS Tunnel Or Reverse Proxy
 
-ChatGPT needs a reachable HTTPS MCP endpoint. For personal use, run the local Streamable HTTP server on `127.0.0.1`, set `GOOGLE_ADS_MCP_AUTH_TOKEN`, and expose only the `/mcp` endpoint through a secure HTTPS tunnel or reverse proxy.
+ChatGPT needs a reachable HTTPS MCP endpoint. For personal use, run the local Streamable HTTP server on `127.0.0.1` and expose only the MCP and OAuth paths through a secure HTTPS tunnel or reverse proxy.
 
 The tunnel/proxy should:
 
 - terminate HTTPS
-- forward the `/mcp` path to `http://127.0.0.1:8000/mcp`
+- forward `/mcp` to `http://127.0.0.1:8000/mcp`
+- forward `/.well-known/oauth-protected-resource/mcp`
+- forward `/.well-known/oauth-authorization-server`
+- forward `/oauth/authorize`, `/oauth/token`, `/oauth/register`, and `/oauth/revoke`
 - preserve HTTP method, body, and MCP headers
 - preserve or intentionally set the public `Host` header configured in `GOOGLE_ADS_MCP_PUBLIC_HOST`
-- pass the `Authorization` header through unchanged if bearer auth is enabled
+- pass the `Authorization` header through unchanged for OAuth access tokens or static bearer fallback
 
 The application does not depend on a specific tunnel vendor.
 
@@ -126,6 +202,22 @@ For the current production tunnel, the MCP endpoint is:
 
 ```text
 https://googleads-mcp.thebesads.com/mcp
+```
+
+Configure ChatGPT Business Custom Apps with:
+
+- MCP server URL: `https://googleads-mcp.thebesads.com/mcp`
+- Authentication: OAuth
+- Scopes: `google_ads.read offline_access`
+
+Dynamic client registration is enabled so ChatGPT can register its exact redirect
+URI and complete account linking with PKCE S256.
+
+ChatGPT will discover:
+
+```text
+https://googleads-mcp.thebesads.com/.well-known/oauth-protected-resource/mcp
+https://googleads-mcp.thebesads.com/.well-known/oauth-authorization-server
 ```
 
 If a browser-style `Origin` header is present, only `https://googleads-mcp.thebesads.com` is allowed for this production host. Unrelated hosts are rejected before tool execution.
@@ -155,6 +247,12 @@ The service must bind only to localhost:
 GOOGLE_ADS_MCP_HOST=127.0.0.1
 GOOGLE_ADS_MCP_PORT=8010
 GOOGLE_ADS_MCP_PUBLIC_HOST=googleads-mcp.thebesads.com
+GOOGLE_ADS_MCP_PUBLIC_ORIGIN=https://googleads-mcp.thebesads.com
+GOOGLE_ADS_MCP_AUTH_MODE=oauth
+GOOGLE_ADS_MCP_OAUTH_DB=/var/lib/google-ads-mcp/oauth.db
+GOOGLE_ADS_MCP_OWNER_USERNAME=replace-me
+GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH=replace-with-argon2id-hash
+GOOGLE_ADS_MCP_OAUTH_SECRET=replace-with-at-least-32-random-chars
 ```
 
 Public port `8010` must remain closed. Cloudflare Tunnel should map:
@@ -169,7 +267,7 @@ The public MCP endpoint is:
 https://googleads-mcp.thebesads.com/mcp
 ```
 
-Do not provide Google Ads developer tokens, OAuth client secrets, refresh tokens, or the full MCP bearer token to ChatGPT. ChatGPT should receive only the HTTPS MCP endpoint and, when enabled, the MCP bearer token required by the server.
+Do not provide Google Ads developer tokens, Google OAuth client secrets, Google Ads refresh tokens, or the server-side MCP OAuth secret to ChatGPT. ChatGPT should receive only the HTTPS MCP endpoint and complete OAuth against this MCP service.
 
 Basic service operations:
 
