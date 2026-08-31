@@ -36,8 +36,11 @@ def require_campaign_id(params: dict[str, Any]) -> int:
 def normalize_campaign_id(value: Any) -> int:
     try:
         campaign_id = int(value)
-    except (TypeError, ValueError):
-        raise InputValidationError("campaign_id must be an integer.", code="invalid_campaign_id")
+    except (TypeError, ValueError) as exc:
+        raise InputValidationError(
+            "campaign_id must be an integer.",
+            code="invalid_campaign_id",
+        ) from exc
     if campaign_id <= 0:
         raise InputValidationError("campaign_id must be positive.", code="invalid_campaign_id")
     return campaign_id
@@ -75,7 +78,7 @@ def optional_text(value: Any | None, *, field_name: str, max_length: int = 200) 
     return text
 
 
-def require_date_range(params: dict[str, Any]) -> "DateRange":
+def require_date_range(params: dict[str, Any]) -> DateRange:
     missing = [name for name in ("start_date", "end_date") if name not in params]
     if missing:
         raise InputValidationError(
@@ -95,11 +98,11 @@ def require_date_range(params: dict[str, Any]) -> "DateRange":
 def parse_iso_date(value: Any, *, field_name: str) -> date:
     try:
         return date.fromisoformat(str(value))
-    except ValueError:
+    except ValueError as exc:
         raise InputValidationError(
             f"{field_name} must use YYYY-MM-DD format.",
             code=f"invalid_{field_name}",
-        )
+        ) from exc
 
 
 @dataclass(frozen=True)

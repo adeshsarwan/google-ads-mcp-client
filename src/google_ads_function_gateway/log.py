@@ -7,7 +7,6 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-
 SENSITIVE_KEY_PARTS = (
     "authorization",
     "client_secret",

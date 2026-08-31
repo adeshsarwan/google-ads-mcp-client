@@ -15,18 +15,27 @@ from google_ads_function_gateway.exceptions import normalize_exception
 from google_ads_function_gateway.log import StructuredLogger
 from google_ads_function_gateway.query.executor import FixedGaqlExecutor
 
-
 RequestT = TypeVar("RequestT")
 
 
 class GoogleAdsCatalogueFunction(ABC, Generic[RequestT]):
     function_name: str
 
-    def __init__(self, *, executor: FixedGaqlExecutor, logger: StructuredLogger | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        executor: FixedGaqlExecutor,
+        logger: StructuredLogger | None = None,
+    ) -> None:
         self._executor = executor
         self._logger = logger or StructuredLogger()
 
-    def execute(self, params: dict[str, Any] | None, *, request_id: str | None = None) -> dict[str, Any]:
+    def execute(
+        self,
+        params: dict[str, Any] | None,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         current_request_id = request_id or new_request_id()
         try:
             request = self.validate(params or {})

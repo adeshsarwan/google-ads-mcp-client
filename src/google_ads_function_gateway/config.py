@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from typing import Iterable
+import pkgutil
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from google_ads_function_gateway.dto.validation import normalize_customer_id
 
@@ -19,12 +21,11 @@ class GoogleAdsSettings:
     refresh_token: str | None = None
     login_customer_id: str | None = None
     api_version: str | None = None
-    page_size: int = 1000
     retry_attempts: int = 3
     allowed_customer_ids: tuple[str, ...] = ()
 
     @classmethod
-    def from_env(cls) -> "GoogleAdsSettings":
+    def from_env(cls) -> GoogleAdsSettings:
         """Load configuration from environment variables."""
 
         login_customer_id = _optional_customer_id(os.getenv("GOOGLE_ADS_LOGIN_CUSTOMER_ID"))
@@ -37,8 +38,7 @@ class GoogleAdsSettings:
             client_secret=os.getenv("GOOGLE_ADS_CLIENT_SECRET"),
             refresh_token=os.getenv("GOOGLE_ADS_REFRESH_TOKEN"),
             login_customer_id=login_customer_id,
-            api_version=os.getenv("GOOGLE_ADS_API_VERSION") or None,
-            page_size=_int_from_env("GOOGLE_ADS_PAGE_SIZE", 1000),
+            api_version=os.getenv("GOOGLE_ADS_API_VERSION") or resolve_default_api_version(),
             retry_attempts=_int_from_env("GOOGLE_ADS_RETRY_ATTEMPTS", 3),
             allowed_customer_ids=allowed_customer_ids,
         )
@@ -99,8 +99,30 @@ def _optional_customer_id(raw: str | None) -> str | None:
 
 
 def _customer_ids_from_csv(raw: str | Iterable[str]) -> tuple[str, ...]:
-    if isinstance(raw, str):
-        values = raw.split(",")
-    else:
-        values = raw
+    values = raw.split(",") if isinstance(raw, str) else raw
     return tuple(normalize_customer_id(value) for value in values if str(value).strip())
+
+
+def resolve_default_api_version() -> str | None:
+    """Resolve the Google Ads API version the gateway will use by default."""
+
+    versions = supported_api_versions()
+    if not versions:
+        return None
+    return versions[-1]
+
+
+def supported_api_versions() -> tuple[str, ...]:
+    """Return API versions packaged by the installed google-ads distribution."""
+
+    try:
+        import google.ads.googleads as googleads
+    except ImportError:
+        return ()
+
+    versions = [
+        module.name
+        for module in pkgutil.iter_modules(googleads.__path__)
+        if re.fullmatch(r"v\d+", module.name)
+    ]
+    return tuple(sorted(versions, key=lambda value: int(value.removeprefix("v"))))

@@ -20,7 +20,7 @@ from google_ads_function_gateway.dto.validation import (
     require_customer_id,
     require_date_range,
 )
-from google_ads_function_gateway.exceptions import InputValidationError
+from google_ads_function_gateway.exceptions import InputValidationError, normalize_exception
 from google_ads_function_gateway.functions.base import GoogleAdsCatalogueFunction
 from google_ads_function_gateway.query.gaql import (
     and_where,
@@ -81,7 +81,10 @@ class ListCampaignsFunction(GoogleAdsCatalogueFunction[CampaignFilterRequest]):
             function=self.function_name,
         )
         campaigns = [_normalize_campaign_summary(row) for row in rows]
-        return campaigns, response_meta(customer_ids=[request.customer_id], row_count=len(campaigns))
+        return campaigns, response_meta(
+            customer_ids=[request.customer_id],
+            row_count=len(campaigns),
+        )
 
 
 class GetCampaignDetailsFunction(GoogleAdsCatalogueFunction[CampaignDetailsRequest]):
@@ -99,12 +102,23 @@ class GetCampaignDetailsFunction(GoogleAdsCatalogueFunction[CampaignDetailsReque
         *,
         request_id: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        rows = self._executor.search(
-            customer_id=request.customer_id,
-            query=_campaign_details_query(request.campaign_id),
-            request_id=request_id,
-            function=self.function_name,
-        )
+        try:
+            rows = self._executor.search(
+                customer_id=request.customer_id,
+                query=_campaign_details_query(request.campaign_id),
+                request_id=request_id,
+                function=self.function_name,
+            )
+        except Exception as exc:
+            error = normalize_exception(exc)
+            if error.category != "validation":
+                raise
+            rows = self._executor.search(
+                customer_id=request.customer_id,
+                query=_campaign_details_fallback_query(request.campaign_id),
+                request_id=request_id,
+                function=self.function_name,
+            )
         if not rows:
             return {}, response_meta(customer_ids=[request.customer_id], row_count=0)
 
@@ -217,6 +231,7 @@ ORDER BY campaign.id
 def _campaign_details_query(campaign_id: int) -> str:
     return f"""
 SELECT
+  customer.id,
   customer.currency_code,
   campaign.id,
   campaign.name,
@@ -230,6 +245,27 @@ SELECT
   campaign.bidding_strategy_type,
   campaign.target_cpa.target_cpa_micros,
   campaign.target_roas.target_roas
+FROM campaign
+WHERE campaign.id = {campaign_id}
+LIMIT 1
+""".strip()
+
+
+def _campaign_details_fallback_query(campaign_id: int) -> str:
+    return f"""
+SELECT
+  customer.id,
+  customer.currency_code,
+  campaign.id,
+  campaign.name,
+  campaign.status,
+  campaign.advertising_channel_type,
+  campaign.advertising_channel_sub_type,
+  campaign.campaign_budget,
+  campaign_budget.id,
+  campaign_budget.amount_micros,
+  campaign.bidding_strategy,
+  campaign.bidding_strategy_type
 FROM campaign
 WHERE campaign.id = {campaign_id}
 LIMIT 1
@@ -297,9 +333,11 @@ def _normalize_campaign_summary(row: Any) -> dict[str, Any]:
 
 def _normalize_campaign_details(row: Any, *, fallback_customer_id: str) -> dict[str, Any]:
     target_cpa_micros = get_path(row, "campaign.target_cpa.target_cpa_micros")
+    target_roas = get_path(row, "campaign.target_roas.target_roas")
     daily_budget_micros = get_path(row, "campaign_budget.amount_micros")
+    bidding_strategy_type = normalize_enum(get_path(row, "campaign.bidding_strategy_type"))
     return {
-        "customer_id": normalize_customer_id(get_path(row, "customer.id", fallback_customer_id)),
+        "customer_id": _selected_customer_id(row, fallback_customer_id=fallback_customer_id),
         "campaign_id": number_or_none(get_path(row, "campaign.id")),
         "campaign_name": get_path(row, "campaign.name"),
         "status": normalize_enum(get_path(row, "campaign.status")),
@@ -311,17 +349,32 @@ def _normalize_campaign_details(row: Any, *, fallback_customer_id: str) -> dict[
         "daily_budget": micros_to_units(daily_budget_micros),
         "currency": get_path(row, "customer.currency_code"),
         "bidding_strategy": get_path(row, "campaign.bidding_strategy"),
-        "bidding_strategy_type": normalize_enum(get_path(row, "campaign.bidding_strategy_type")),
-        "target_cpa_micros": number_or_none(target_cpa_micros),
-        "target_cpa": micros_to_units(target_cpa_micros),
-        "target_roas": number_or_none(get_path(row, "campaign.target_roas.target_roas")),
+        "bidding_strategy_type": bidding_strategy_type,
+        "target_cpa_micros": _applicable_bidding_value(
+            target_cpa_micros,
+            bidding_strategy_type=bidding_strategy_type,
+            applicable_strategy_type="TARGET_CPA",
+            converter=number_or_none,
+        ),
+        "target_cpa": _applicable_bidding_value(
+            target_cpa_micros,
+            bidding_strategy_type=bidding_strategy_type,
+            applicable_strategy_type="TARGET_CPA",
+            converter=micros_to_units,
+        ),
+        "target_roas": _applicable_bidding_value(
+            target_roas,
+            bidding_strategy_type=bidding_strategy_type,
+            applicable_strategy_type="TARGET_ROAS",
+            converter=number_or_none,
+        ),
     }
 
 
 def _normalize_campaign_cost(row: Any, *, fallback_customer_id: str) -> dict[str, Any]:
     cost_micros = get_path(row, "metrics.cost_micros")
     return {
-        "customer_id": normalize_customer_id(get_path(row, "customer.id", fallback_customer_id)),
+        "customer_id": _selected_customer_id(row, fallback_customer_id=fallback_customer_id),
         "campaign_id": number_or_none(get_path(row, "campaign.id")),
         "campaign_name": get_path(row, "campaign.name"),
         "status": normalize_enum(get_path(row, "campaign.status")),
@@ -338,7 +391,7 @@ def _normalize_campaign_performance(row: Any, *, fallback_customer_id: str) -> d
     conversions = number_or_none(get_path(row, "metrics.conversions"))
     cpa = cost / conversions if cost is not None and conversions and conversions > 0 else None
     return {
-        "customer_id": normalize_customer_id(get_path(row, "customer.id", fallback_customer_id)),
+        "customer_id": _selected_customer_id(row, fallback_customer_id=fallback_customer_id),
         "campaign_id": number_or_none(get_path(row, "campaign.id")),
         "campaign_name": get_path(row, "campaign.name"),
         "status": normalize_enum(get_path(row, "campaign.status")),
@@ -376,4 +429,25 @@ def _customer_ids_for_performance(params: dict[str, Any]) -> tuple[str, ...]:
             "customer_ids must be a non-empty list.",
             code="invalid_customer_ids",
         )
-    return tuple(dict.fromkeys(normalize_customer_id(customer_id) for customer_id in raw_customer_ids))
+    return tuple(
+        dict.fromkeys(normalize_customer_id(customer_id) for customer_id in raw_customer_ids)
+    )
+
+
+def _selected_customer_id(row: Any, *, fallback_customer_id: str) -> str:
+    customer_id = get_path(row, "customer.id", fallback_customer_id)
+    if customer_id in (None, 0, "0"):
+        customer_id = fallback_customer_id
+    return normalize_customer_id(customer_id)
+
+
+def _applicable_bidding_value(
+    value: Any,
+    *,
+    bidding_strategy_type: str | None,
+    applicable_strategy_type: str,
+    converter: Any,
+) -> Any:
+    if bidding_strategy_type != applicable_strategy_type:
+        return None
+    return converter(value)

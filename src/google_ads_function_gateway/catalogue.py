@@ -20,6 +20,7 @@ from google_ads_function_gateway.functions import (
 )
 from google_ads_function_gateway.functions.base import GoogleAdsCatalogueFunction
 from google_ads_function_gateway.log import StructuredLogger
+from google_ads_function_gateway.query.discovery import CustomerDiscoveryExecutor
 from google_ads_function_gateway.query.executor import FixedGaqlExecutor, RetryPolicy
 from google_ads_function_gateway.security.access_policy import (
     AllowListCustomerAccessPolicy,
@@ -41,21 +42,29 @@ class GoogleAdsFunctionCatalogue:
         client: GoogleAdsClientWrapper | None = None,
         access_policy: CustomerAccessPolicy | None = None,
         logger: StructuredLogger | None = None,
-    ) -> "GoogleAdsFunctionCatalogue":
+    ) -> GoogleAdsFunctionCatalogue:
         settings = settings or GoogleAdsSettings.from_env()
         logger = logger or StructuredLogger()
         client = client or OfficialGoogleAdsClientWrapper(settings)
-        access_policy = access_policy or AllowListCustomerAccessPolicy(settings.allowed_customer_ids)
+        access_policy = access_policy or AllowListCustomerAccessPolicy(
+            settings.allowed_customer_ids
+        )
+        retry_policy = RetryPolicy(max_attempts=settings.retry_attempts)
         executor = FixedGaqlExecutor(
             client=client,
             access_policy=access_policy,
-            page_size=settings.page_size,
-            retry_policy=RetryPolicy(max_attempts=settings.retry_attempts),
+            retry_policy=retry_policy,
+            logger=logger,
+        )
+        discovery_executor = CustomerDiscoveryExecutor(
+            client=client,
+            retry_policy=retry_policy,
             logger=logger,
         )
         functions = [
             ListAccountsFunction(
                 executor=executor,
+                discovery_executor=discovery_executor,
                 logger=logger,
                 manager_customer_id=settings.login_customer_id,
             ),

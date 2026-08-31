@@ -23,7 +23,6 @@ class OfficialGoogleAdsClientWrapper:
         customer_id: str,
         query: str,
         page_token: str | None,
-        page_size: int,
         request_id: str,
     ) -> SearchPage:
         client = self._get_client()
@@ -31,7 +30,6 @@ class OfficialGoogleAdsClientWrapper:
         request = self._get_type(client, "SearchGoogleAdsRequest")
         request.customer_id = customer_id
         request.query = query
-        request.page_size = page_size
         if page_token:
             request.page_token = page_token
 

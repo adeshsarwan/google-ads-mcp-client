@@ -14,7 +14,7 @@ The implementation is a Python package under `src/google_ads_function_gateway`.
 - `client/`: fakeable Google Ads client protocol plus the official `google-ads-python` adapter.
 - `auth/`: OAuth settings bridge.
 - `security/`: customer access-policy abstractions. The default production policy is allow-list based and deny-all when no allow-list is configured.
-- `query/`: deterministic GAQL helpers and `FixedGaqlExecutor`, which performs authorization, pagination, retry, and normalized API error handling.
+- `query/`: deterministic GAQL helpers, authorized report execution, and dedicated discovery execution.
 - `functions/`: approved function classes. GAQL lives inside these classes and helpers, never in caller input.
 - `dto/`: response-envelope and validation helpers.
 - `exceptions.py`: normalized public errors.
@@ -29,15 +29,14 @@ Environment variables for live Google Ads execution:
 - `GOOGLE_ADS_CLIENT_SECRET`
 - `GOOGLE_ADS_REFRESH_TOKEN`
 - `GOOGLE_ADS_LOGIN_CUSTOMER_ID`
-- `GOOGLE_ADS_API_VERSION` optional; if omitted, the installed Google Ads library default is used
+- `GOOGLE_ADS_API_VERSION` optional; if omitted, the gateway uses the highest API version packaged by `google-ads-python`
 - `GOOGLE_ADS_ALLOWED_CUSTOMER_IDS` comma-separated allow-list
-- `GOOGLE_ADS_PAGE_SIZE` optional, default `1000`
 - `GOOGLE_ADS_RETRY_ATTEMPTS` optional, default `3`
 
-Install the official Google Ads dependency for live calls:
+Install the official Google Ads dependency and dev tooling:
 
 ```bash
-python3 -m pip install -e ".[google-ads]"
+python -m pip install -e ".[dev]"
 ```
 
 ## Authorization Behavior
@@ -46,11 +45,14 @@ Every customer-specific GAQL execution goes through `CustomerAccessPolicy.ensure
 
 The default `AllowListCustomerAccessPolicy` permits only customer IDs configured in `GOOGLE_ADS_ALLOWED_CUSTOMER_IDS`. If the allow-list is empty, all customer-specific calls fail closed.
 
-`list_accounts` behaves as follows:
+Discovery and reporting use separate execution paths:
 
-- With `GOOGLE_ADS_LOGIN_CUSTOMER_ID`, it queries `customer_client` through the configured manager account after the manager ID passes the access policy.
-- Without a login customer ID, it calls `CustomerService.list_accessible_customers` and returns IDs only.
-- In both modes, returned accounts are filtered through the access policy before being returned.
+- `list_accounts` is discovery-only. It may inspect accounts reachable from the configured `GOOGLE_ADS_LOGIN_CUSTOMER_ID` even when the allow-list is empty.
+- The configured login customer ID is trusted only as the discovery root. It is not a general reporting authorization bypass.
+- Discovered child accounts are returned even when they are not yet present in `GOOGLE_ADS_ALLOWED_CUSTOMER_IDS`.
+- Without a login customer ID, `list_accounts` calls `CustomerService.list_accessible_customers` and returns directly accessible customer IDs only.
+- Reporting functions still call `FixedGaqlExecutor.search`, which fails closed unless the target customer ID is explicitly allow-listed.
+- To authorize reporting, copy selected discovered customer IDs into `GOOGLE_ADS_ALLOWED_CUSTOMER_IDS`.
 
 ## Fixed-Query Principle
 
@@ -119,6 +121,9 @@ Output rows:
 - `timezone`
 - `status`
 - `manager`
+- `level`
+- `discovery_source`
+- `account_relationship`
 
 Example:
 
@@ -218,6 +223,8 @@ Output:
 - `target_roas`
 
 Non-applicable bidding fields return `null`; they do not fail the whole response.
+
+The implementation first uses a predefined details query that includes target CPA and target ROAS fields. If Google Ads rejects that predefined query for API-version field compatibility, it retries once with a second predefined details query that excludes those optional bidding-scheme fields. It does not generate GAQL at runtime.
 
 Example:
 
@@ -369,6 +376,8 @@ Phase A:
 - DONE: Standard normalized JSON response envelope.
 - DONE: Structured logging with credential redaction.
 - DONE: Unit-test structure and skipped live integration-test structure.
+- DONE: CLI entrypoint for standardized function invocation.
+- DONE: Safe configuration doctor command.
 
 Phase B:
 
@@ -379,9 +388,32 @@ Phase B:
 - DONE: 05 `get_campaign_cost`
 - DONE: 06 `get_campaign_performance`
 
+Stage 1B:
+
+- DONE: Official `google-ads` Python client added as an application dependency.
+- DONE: Dev install path added with `ruff`.
+- DONE: `.env.example` added for local credential setup without committing secrets.
+- DONE: `python -m google_ads_function_gateway doctor` added.
+- DONE: CLI commands added for all six standardized functions.
+- DONE: Bootstrap authorization bug fixed with a dedicated discovery executor.
+- DONE: MCC discovery can run with an empty `GOOGLE_ADS_ALLOWED_CUSTOMER_IDS`.
+- DONE: Reporting functions still fail closed until target customer IDs are allow-listed.
+- DONE: Opt-in live read-only smoke tests added behind `GOOGLE_ADS_RUN_LIVE_TESTS=1`.
+- DONE: Installed `google-ads` package version confirmed locally as `31.4.0`.
+- DONE: Packaged Google Ads API versions confirmed locally as `v21`, `v22`, `v23`, `v24`, and `v25`; default gateway API version resolves to `v25`.
+
+Stage 1B API Compatibility Notes:
+
+- `list_accounts`: uses a predefined `customer_client` hierarchy query for MCC discovery.
+- `get_account_details`: uses a predefined `customer` query.
+- `list_campaigns`: uses predefined `campaign` summary fields and optional validated filters.
+- `get_campaign_details`: uses predefined budget and bidding fields, with a second predefined fallback query for optional target CPA/target ROAS compatibility.
+- `get_campaign_cost`: uses predefined `segments.date` and `metrics.cost_micros` fields; `cost = cost_micros / 1000000`.
+- `get_campaign_performance`: uses predefined impressions, clicks, cost, conversions, conversion value, CTR, and average CPC fields; CPA returns `null` when conversions are zero.
+- Live compatibility validation requires real credentials and `GOOGLE_ADS_RUN_LIVE_TESTS=1`; it was not attempted without credentials.
+
 Partial/TODO:
 
 - PARTIAL: Live Google Ads integration tests are scaffolded but skipped by default. They require real credentials, an allow-list, and `GOOGLE_ADS_RUN_LIVE_TESTS=1`.
-- TODO: Validate selected GAQL fields against the exact installed Google Ads API version during live integration setup.
-- TODO: Add an HTTP, CLI, cron, dashboard, MCP, or automation adapter when those surfaces are requested.
+- TODO: Add an HTTP, cron, dashboard, MCP, or automation adapter when those surfaces are requested.
 - TODO: Add write/mutation functions only through a separate approved catalogue phase.

@@ -29,7 +29,6 @@ class FakeGoogleAdsClient:
         customer_id: str,
         query: str,
         page_token: str | None,
-        page_size: int,
         request_id: str,
     ) -> SearchPage:
         self.search_calls.append(
@@ -37,7 +36,6 @@ class FakeGoogleAdsClient:
                 "customer_id": customer_id,
                 "query": query,
                 "page_token": page_token,
-                "page_size": page_size,
                 "request_id": request_id,
             }
         )
@@ -78,7 +76,6 @@ def build_catalogue(
     settings = GoogleAdsSettings(
         login_customer_id=manager_customer_id,
         allowed_customer_ids=tuple(allowed_customer_ids),
-        page_size=2,
         retry_attempts=2,
     )
     return GoogleAdsFunctionCatalogue.from_settings(

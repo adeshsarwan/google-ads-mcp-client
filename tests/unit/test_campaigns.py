@@ -112,7 +112,7 @@ class CampaignFunctionTests(unittest.TestCase):
                 "1112223333": [
                     [
                         {
-                            "customer": {"id": "1112223333", "currency_code": "USD"},
+                            "customer": {"id": 0, "currency_code": "USD"},
                             "campaign": {
                                 "id": 10,
                                 "name": "Brand Search",
@@ -140,9 +140,49 @@ class CampaignFunctionTests(unittest.TestCase):
         )
 
         self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["customer_id"], "1112223333")
         self.assertEqual(result["data"]["daily_budget"], 50.0)
         self.assertEqual(result["data"]["daily_budget_micros"], 50000000)
         self.assertIsNone(result["data"]["target_cpa"])
+        self.assertIsNone(result["data"]["target_roas"])
+        self.assertIn("customer.id", fake.search_calls[0]["query"])
+
+    def test_get_campaign_details_nulls_non_applicable_target_roas_default(self) -> None:
+        fake = FakeGoogleAdsClient(
+            search_pages_by_customer={
+                "1112223333": [
+                    [
+                        {
+                            "customer": {"id": "1112223333", "currency_code": "USD"},
+                            "campaign": {
+                                "id": 10,
+                                "name": "Brand Search",
+                                "status": "ENABLED",
+                                "advertising_channel_type": "DISPLAY",
+                                "advertising_channel_sub_type": "UNSPECIFIED",
+                                "campaign_budget": "customers/1112223333/campaignBudgets/20",
+                                "bidding_strategy": "",
+                                "bidding_strategy_type": "TARGET_CPA",
+                                "target_cpa": {"target_cpa_micros": 12000000},
+                                "target_roas": {"target_roas": 0.0},
+                            },
+                            "campaign_budget": {"id": 20, "amount_micros": 50000000},
+                        }
+                    ]
+                ]
+            }
+        )
+        catalogue = build_catalogue(fake, allowed_customer_ids=("1112223333",))
+
+        result = catalogue.invoke(
+            "get_campaign_details",
+            {"customer_id": "1112223333", "campaign_id": 10},
+            request_id="req-c6-target-cpa",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["target_cpa"], 12.0)
+        self.assertEqual(result["data"]["target_cpa_micros"], 12000000)
         self.assertIsNone(result["data"]["target_roas"])
 
     def test_get_campaign_details_empty_result(self) -> None:
@@ -187,7 +227,7 @@ class CampaignFunctionTests(unittest.TestCase):
     def test_get_campaign_details_google_ads_error(self) -> None:
         fake = FakeGoogleAdsClient(
             side_effects_by_customer={
-                "1112223333": [FakeGoogleAdsException("INVALID_ARGUMENT")]
+                "1112223333": [FakeGoogleAdsException("UNKNOWN_ERROR")]
             }
         )
         catalogue = build_catalogue(fake, allowed_customer_ids=("1112223333",))
@@ -199,7 +239,45 @@ class CampaignFunctionTests(unittest.TestCase):
         )
 
         self.assertFalse(result["success"])
-        self.assertEqual(result["error"]["category"], "validation")
+        self.assertEqual(result["error"]["category"], "google_ads_api")
+
+    def test_get_campaign_details_uses_predefined_fallback_for_bidding_field_error(self) -> None:
+        fake = FakeGoogleAdsClient(
+            side_effects_by_customer={
+                "1112223333": [
+                    FakeGoogleAdsException("INVALID_ARGUMENT"),
+                    [
+                        {
+                            "customer": {"id": "1112223333", "currency_code": "USD"},
+                            "campaign": {
+                                "id": 10,
+                                "name": "Brand Search",
+                                "status": "ENABLED",
+                                "advertising_channel_type": "SEARCH",
+                                "advertising_channel_sub_type": None,
+                                "campaign_budget": "customers/1112223333/campaignBudgets/20",
+                                "bidding_strategy": None,
+                                "bidding_strategy_type": "MANUAL_CPC",
+                            },
+                            "campaign_budget": {"id": 20, "amount_micros": 50000000},
+                        }
+                    ],
+                ]
+            }
+        )
+        catalogue = build_catalogue(fake, allowed_customer_ids=("1112223333",))
+
+        result = catalogue.invoke(
+            "get_campaign_details",
+            {"customer_id": "1112223333", "campaign_id": 10},
+            request_id="req-c10-fallback",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["data"]["campaign_id"], 10)
+        self.assertEqual(result["data"]["daily_budget"], 50.0)
+        self.assertIsNone(result["data"]["target_cpa"])
+        self.assertIsNone(result["data"]["target_roas"])
 
     def test_get_campaign_cost_success_conversion_and_pagination(self) -> None:
         fake = FakeGoogleAdsClient(
@@ -242,6 +320,9 @@ class CampaignFunctionTests(unittest.TestCase):
         self.assertEqual(result["data"][0]["cost"], 1.234567)
         self.assertEqual(result["data"][0]["cost_micros"], 1234567)
         self.assertEqual(result["data"][1]["cost"], 0.0)
+        self.assertNotIn("page_size", fake.search_calls[0])
+        self.assertNotIn("page_size", fake.search_calls[1])
+        self.assertIsNone(fake.search_calls[0]["page_token"])
         self.assertEqual(fake.search_calls[1]["page_token"], "1")
 
     def test_get_campaign_cost_empty_result(self) -> None:

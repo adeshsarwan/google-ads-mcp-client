@@ -14,7 +14,7 @@ from google_ads_function_gateway.dto.validation import (
 )
 from google_ads_function_gateway.exceptions import InputValidationError
 from google_ads_function_gateway.functions.base import GoogleAdsCatalogueFunction
-
+from google_ads_function_gateway.query.discovery import CustomerDiscoveryExecutor
 
 LIST_ACCOUNTS_GAQL = """
 SELECT
@@ -57,8 +57,15 @@ class GetAccountDetailsRequest:
 class ListAccountsFunction(GoogleAdsCatalogueFunction[ListAccountsRequest]):
     function_name = "list_accounts"
 
-    def __init__(self, *, manager_customer_id: str | None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        discovery_executor: CustomerDiscoveryExecutor,
+        manager_customer_id: str | None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
+        self._discovery_executor = discovery_executor
         self._manager_customer_id = (
             normalize_customer_id(manager_customer_id) if manager_customer_id else None
         )
@@ -79,19 +86,24 @@ class ListAccountsFunction(GoogleAdsCatalogueFunction[ListAccountsRequest]):
         request_id: str,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if request.manager_customer_id:
-            rows = self._executor.search(
-                customer_id=request.manager_customer_id,
+            rows = self._discovery_executor.search_manager_customer_clients(
+                manager_customer_id=request.manager_customer_id,
                 query=LIST_ACCOUNTS_GAQL,
                 request_id=request_id,
                 function=self.function_name,
             )
             accounts = [
-                account
+                {**account, "discovery_source": "configured_mcc", "account_relationship": "child"}
                 for account in (_normalize_customer_client(row) for row in rows)
-                if account["customer_id"] and self._executor.can_access_customer(account["customer_id"])
+                if account["customer_id"]
             ]
+            meta_extra = {
+                "discovery_mode": "configured_mcc",
+                "manager_customer_id": request.manager_customer_id,
+                "authorization": "discovery_only",
+            }
         else:
-            customer_ids = self._executor.list_accessible_customers(
+            customer_ids = self._discovery_executor.list_direct_accessible_customers(
                 request_id=request_id,
                 function=self.function_name,
             )
@@ -103,15 +115,22 @@ class ListAccountsFunction(GoogleAdsCatalogueFunction[ListAccountsRequest]):
                     "timezone": None,
                     "status": None,
                     "manager": None,
+                    "discovery_source": "accessible_customers",
+                    "account_relationship": "direct",
                 }
                 for customer_id in customer_ids
-                if self._executor.can_access_customer(customer_id)
             ]
+            meta_extra = {
+                "discovery_mode": "direct_accessible_customers",
+                "manager_customer_id": None,
+                "authorization": "discovery_only",
+            }
 
         return accounts, response_meta(
             customer_ids=[account["customer_id"] for account in accounts],
             currency_codes=[account.get("currency_code") for account in accounts],
             row_count=len(accounts),
+            **meta_extra,
         )
 
 
@@ -158,6 +177,7 @@ def _normalize_customer_client(row: Any) -> dict[str, Any]:
         "timezone": get_path(row, "customer_client.time_zone"),
         "status": normalize_enum(get_path(row, "customer_client.status")),
         "manager": bool(manager) if manager is not None else None,
+        "level": get_path(row, "customer_client.level"),
     }
 
 

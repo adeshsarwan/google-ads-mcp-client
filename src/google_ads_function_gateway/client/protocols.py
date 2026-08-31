@@ -20,7 +20,6 @@ class GoogleAdsClientWrapper(Protocol):
         customer_id: str,
         query: str,
         page_token: str | None,
-        page_size: int,
         request_id: str,
     ) -> SearchPage:
         """Execute one fixed Google Ads search page."""
