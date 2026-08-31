@@ -239,11 +239,13 @@ missing, invalid, or under-scoped tokens return an MCP auth challenge via
 
 ChatGPT Business Custom App discovery may first send an unauthenticated empty
 `POST /mcp` reachability probe with `Content-Length: 0` before it fetches OAuth
-metadata or sends MCP JSON-RPC. The server answers only that exact empty probe
-with `204 No Content`. It does not create an MCP session, authenticate the
-request, issue OAuth tokens, or execute tools. Any POST containing MCP headers,
-authorization, a session ID, malformed JSON, a JSON-RPC batch, or a non-empty
-body continues through the SDK's strict MCP validation path.
+metadata or sends MCP JSON-RPC. In OAuth mode, the server answers only that
+exact empty probe with `401 Unauthorized` and a `WWW-Authenticate` challenge
+pointing to the protected-resource metadata. It does not create an MCP session,
+authenticate the request, issue OAuth tokens, or execute tools. Any POST
+containing MCP headers, authorization, a session ID, malformed JSON, a JSON-RPC
+batch, or a non-empty body continues through the SDK's strict MCP validation
+path.
 
 OAuth owner approval happens on server-hosted login and approval pages. The password
 stored in `.env` must be an Argon2id hash in `GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH`;
@@ -293,8 +295,12 @@ Set `GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=1` only when diagnosing remote MCP
 connectivity. It logs secret-free request facts such as path, HTTP status,
 Content-Type, Accept, User-Agent, Content-Length, MCP session/protocol header
 presence, MCP method header, JSON top-level type, JSON-RPC version, JSON-RPC id
-type, parse-failure category, and duration to stderr. It never logs
-Authorization header values, cookies, OAuth tokens, Google Ads credentials,
+type, parse-failure category, and duration to stderr. It also logs safe OAuth
+metadata for `/oauth/register` and `/oauth/authorize`, including redirect URIs,
+scope names, grant/response types, token endpoint auth method, client name,
+software ID, status, and booleans for whether a client ID or client secret was
+issued. It never logs Authorization header values, cookies, OAuth client secrets,
+authorization codes, OAuth tokens, owner passwords, Google Ads credentials, raw
 request parameters, or response data.
 
 ### Tunnel Compatibility

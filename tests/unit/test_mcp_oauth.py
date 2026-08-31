@@ -167,6 +167,92 @@ class McpOAuthTests(unittest.TestCase):
             self.assertEqual(response.status_code, 400)
             self.assertEqual(response.json()["error"], "invalid_redirect_uri")
 
+    def test_oauth_register_diagnostics_log_safe_metadata_only(self) -> None:
+        app, _, _ = self._build_oauth_app()
+
+        with patch.dict(os.environ, {"GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS": "1"}), TestClient(
+            app,
+            base_url=PUBLIC_ORIGIN,
+        ) as client, self.assertLogs(
+            "google_ads_function_gateway.mcp_oauth",
+            level="WARNING",
+        ) as logs:
+            response = client.post(
+                "/oauth/register",
+                json={
+                    "redirect_uris": [REDIRECT_URI],
+                    "client_name": "ChatGPT",
+                    "scope": f"{READ_SCOPE} {OFFLINE_ACCESS_SCOPE}",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "client_secret_post",
+                    "software_id": "openai-chatgpt",
+                },
+                headers={"Host": PUBLIC_HOST},
+            )
+
+        response_body = response.json()
+        joined = "\n".join(logs.output)
+        self.assertEqual(response.status_code, 201)
+        self.assertIn('"event": "mcp_oauth_register"', joined)
+        self.assertIn(f'"request_redirect_uris": ["{REDIRECT_URI}"]', joined)
+        self.assertIn('"request_token_endpoint_auth_method": "client_secret_post"', joined)
+        self.assertIn('"request_grant_types": ["authorization_code", "refresh_token"]', joined)
+        self.assertIn('"request_response_types": ["code"]', joined)
+        self.assertIn('"request_scopes": ["google_ads.read", "offline_access"]', joined)
+        self.assertIn('"request_client_name": "ChatGPT"', joined)
+        self.assertIn('"request_software_id": "openai-chatgpt"', joined)
+        self.assertIn('"response_client_id_issued": true', joined)
+        self.assertIn('"response_client_secret_issued": true', joined)
+        self.assertIn('"response_token_endpoint_auth_method": "client_secret_post"', joined)
+        self.assertNotIn(response_body["client_secret"], joined)
+
+    def test_oauth_authorize_diagnostics_log_safe_metadata_only(self) -> None:
+        app, _, _ = self._build_oauth_app()
+        verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~abc"
+        code_challenge = _pkce_s256(verifier)
+
+        with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
+            registered = _register_client(client)
+            with patch.dict(
+                os.environ,
+                {"GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS": "1"},
+            ), self.assertLogs(
+                "google_ads_function_gateway.mcp_oauth",
+                level="WARNING",
+            ) as logs:
+                response = client.get(
+                    "/oauth/authorize",
+                    params={
+                        "response_type": "code",
+                        "client_id": registered["client_id"],
+                        "redirect_uri": REDIRECT_URI,
+                        "scope": f"{READ_SCOPE} {OFFLINE_ACCESS_SCOPE}",
+                        "state": "unit-state",
+                        "code_challenge": code_challenge,
+                        "code_challenge_method": "S256",
+                        "resource": RESOURCE_URL,
+                    },
+                    headers={"Host": PUBLIC_HOST},
+                    follow_redirects=False,
+                )
+
+        joined = "\n".join(logs.output)
+        self.assertEqual(response.status_code, 302)
+        self.assertIn('"event": "mcp_oauth_authorize"', joined)
+        self.assertIn('"client_id_present": true', joined)
+        self.assertIn('"client_registered": true', joined)
+        self.assertIn('"code_challenge_method": "S256"', joined)
+        self.assertIn('"code_challenge_present": true', joined)
+        self.assertIn('"next_step": "owner_login"', joined)
+        self.assertIn(f'"redirect_uri": "{REDIRECT_URI}"', joined)
+        self.assertIn('"requested_scopes": ["google_ads.read", "offline_access"]', joined)
+        self.assertIn(f'"resource": "{RESOURCE_URL}"', joined)
+        self.assertIn('"state_present": true', joined)
+        self.assertNotIn(code_challenge, joined)
+        self.assertNotIn("unit-state", joined)
+        self.assertNotIn(registered["client_id"], joined)
+
     def test_authorization_code_pkce_exchange_and_refresh_rotation(self) -> None:
         app, oauth_server, _ = self._build_oauth_app()
 
@@ -652,7 +738,9 @@ class McpOAuthTests(unittest.TestCase):
             {name: expected_status for name, _, _, expected_status in variants},
         )
 
-    def test_chatgpt_empty_post_probe_returns_no_content_without_side_effects(self) -> None:
+    def test_chatgpt_empty_post_probe_returns_oauth_challenge_without_side_effects(
+        self,
+    ) -> None:
         catalogue = _FakeCatalogue(_success_response("list_accounts", []))
         app, oauth_server, _ = self._build_oauth_app(catalogue)
 
@@ -680,8 +768,15 @@ class McpOAuthTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(probe.status_code, 204)
-        self.assertEqual(probe.content, b"")
+        self.assertEqual(probe.status_code, 401)
+        self.assertEqual(probe.json(), {"error": "unauthorized"})
+        self.assertEqual(
+            probe.headers["www-authenticate"],
+            (
+                f'Bearer resource_metadata="{PUBLIC_ORIGIN}'
+                f'/.well-known/oauth-protected-resource/mcp", scope="{READ_SCOPE}"'
+            ),
+        )
         self.assertNotIn("mcp-session-id", probe.headers)
         self.assertEqual(token_rows_after_probe, token_rows_before)
 

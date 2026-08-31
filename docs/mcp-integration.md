@@ -132,12 +132,13 @@ existing customer allow-list.
 
 Some ChatGPT Business discovery runs first send an unauthenticated empty
 `POST /mcp` reachability probe with `Content-Length: 0`. This service answers
-only that exact empty probe with `204 No Content` so discovery can continue to
-OAuth metadata and MCP tool listing. The response is not an MCP JSON-RPC message,
-does not create a session, does not issue OAuth tokens, and does not execute any
-Google Ads function. Empty posts with authorization, MCP session/protocol
-headers, malformed JSON, JSON-RPC arrays, or non-empty bodies continue through
-the SDK's strict validation path.
+only that exact empty probe with `401 Unauthorized` and a `WWW-Authenticate`
+challenge so discovery can continue to OAuth metadata, authorization, and MCP
+tool listing. The response is not an MCP JSON-RPC message, does not create a
+session, does not issue OAuth tokens, and does not execute any Google Ads
+function. Empty posts with authorization, MCP session/protocol headers,
+malformed JSON, JSON-RPC arrays, or non-empty bodies continue through the SDK's
+strict validation path.
 
 ## Static Bearer Fallback
 
@@ -323,6 +324,10 @@ For short diagnostic windows, set `GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=1` and restar
 the service. The diagnostic log contains only safe request metadata: path, HTTP
 status, Content-Type, Accept, User-Agent, Content-Length, MCP session/protocol
 header presence, MCP method header, JSON top-level type, JSON-RPC version,
-JSON-RPC id type, parse-failure category, and duration. It does not log
-Authorization header values, cookies, OAuth tokens, Google Ads credentials,
-request parameters, or response data.
+JSON-RPC id type, parse-failure category, and duration. It also logs safe
+OAuth metadata for `/oauth/register` and `/oauth/authorize`, including redirect
+URIs, scope names, grant/response types, token endpoint auth method, client
+name, software ID, status, and booleans for whether a client ID or client secret
+was issued. It does not log Authorization header values, cookies, OAuth client
+secrets, authorization codes, OAuth tokens, owner passwords, Google Ads
+credentials, raw request parameters, or response data.

@@ -200,9 +200,10 @@ class OptionalOAuthContextMiddleware:
 class EmptyMcpPostProbeMiddleware:
     """Handle ChatGPT's empty unauthenticated MCP reachability probe."""
 
-    def __init__(self, app: ASGIApp, path: str) -> None:
+    def __init__(self, app: ASGIApp, path: str, oauth_server: McpOAuthServer) -> None:
         self.app = app
         self._path = path
+        self._oauth_server = oauth_server
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or not _is_empty_mcp_post_probe_candidate(
@@ -214,7 +215,7 @@ class EmptyMcpPostProbeMiddleware:
 
         messages, body = await _buffer_http_request(receive)
         if body == b"":
-            await _send_no_content(send)
+            await _send_oauth_probe_auth_error(send, self._oauth_server)
             return
 
         async def replay_receive() -> Message:
@@ -498,7 +499,7 @@ def build_streamable_http_app(
         app = BearerTokenAuthMiddleware(app, settings.auth_token)
     if settings.auth_mode == OAUTH_AUTH_MODE and oauth_server is not None:
         app = OptionalOAuthContextMiddleware(app, oauth_server)
-    app = EmptyMcpPostProbeMiddleware(app, settings.path)
+        app = EmptyMcpPostProbeMiddleware(app, settings.path, oauth_server)
     app = HostOriginSecurityMiddleware(app, transport_security)
     if settings.http_diagnostics:
         app = HttpDiagnosticsMiddleware(app)
@@ -944,15 +945,27 @@ async def _send_auth_error(send: Send) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-async def _send_no_content(send: Send) -> None:
+async def _send_oauth_probe_auth_error(
+    send: Send,
+    oauth_server: McpOAuthServer,
+) -> None:
+    body = json.dumps({"error": "unauthorized"}).encode()
+    challenge = (
+        f'Bearer resource_metadata="{oauth_server.settings.protected_resource_metadata_url}", '
+        f'scope="{READ_SCOPE}"'
+    ).encode()
     await send(
         {
             "type": "http.response.start",
-            "status": 204,
-            "headers": [],
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"www-authenticate", challenge),
+            ],
         }
     )
-    await send({"type": "http.response.body", "body": b""})
+    await send({"type": "http.response.body", "body": body})
 
 
 if __name__ == "__main__":

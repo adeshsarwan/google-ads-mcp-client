@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -46,6 +47,7 @@ DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 3600
 DEFAULT_AUTH_CODE_TTL_SECONDS = 300
 DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 2_592_000
 DEFAULT_OWNER_SESSION_TTL_SECONDS = 900
+GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS_ENV_VAR = "GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS"
 
 SESSION_COOKIE = "google_ads_mcp_owner_session"
 CSRF_COOKIE = "google_ads_mcp_csrf"
@@ -697,6 +699,7 @@ class McpOAuthServer(TokenVerifier):
         self.settings = settings
         self.store = store or SQLiteOAuthStore(settings.db_path, settings.oauth_secret)
         self._password_hasher = password_hasher or PasswordHasher()
+        self._logger = logging.getLogger(__name__)
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         client = self.store.get_client(client_id)
@@ -809,79 +812,108 @@ class McpOAuthServer(TokenVerifier):
         if request.method == "OPTIONS":
             return _options_response("POST, OPTIONS")
 
+        payload: object | None = None
+        response_payload: dict[str, Any] | None = None
+
+        def finish(response: Response) -> Response:
+            self._log_register_diagnostic(request, response, payload, response_payload)
+            return response
+
         try:
             payload = json.loads((await request.body()).decode() or "{}")
         except json.JSONDecodeError:
-            return _registration_error("invalid_client_metadata", "Request body must be JSON.")
+            return finish(
+                _registration_error("invalid_client_metadata", "Request body must be JSON.")
+            )
 
         if not isinstance(payload, dict):
-            return _registration_error(
-                "invalid_client_metadata",
-                "Client metadata must be a JSON object.",
+            return finish(
+                _registration_error(
+                    "invalid_client_metadata",
+                    "Client metadata must be a JSON object.",
+                )
             )
 
         redirect_uris = payload.get("redirect_uris")
         if not isinstance(redirect_uris, list) or not redirect_uris:
-            return _registration_error(
-                "invalid_redirect_uri",
-                "redirect_uris must contain at least one exact redirect URI.",
+            return finish(
+                _registration_error(
+                    "invalid_redirect_uri",
+                    "redirect_uris must contain at least one exact redirect URI.",
+                )
             )
 
         normalized_redirects: list[str] = []
         for redirect_uri in redirect_uris:
             if not isinstance(redirect_uri, str) or not _is_safe_redirect_uri(redirect_uri):
-                return _registration_error(
-                    "invalid_redirect_uri",
-                    "redirect_uris must use exact HTTPS URLs or localhost HTTP loopback URLs.",
+                return finish(
+                    _registration_error(
+                        "invalid_redirect_uri",
+                        "redirect_uris must use exact HTTPS URLs or localhost HTTP loopback URLs.",
+                    )
                 )
             normalized_redirects.append(redirect_uri)
 
         token_endpoint_auth_method = payload.get("token_endpoint_auth_method") or "none"
         if token_endpoint_auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
-            return _registration_error(
-                "invalid_client_metadata",
-                f"token_endpoint_auth_method '{token_endpoint_auth_method}' is not supported",
+            return finish(
+                _registration_error(
+                    "invalid_client_metadata",
+                    f"token_endpoint_auth_method '{token_endpoint_auth_method}' is not supported",
+                )
             )
 
         grant_types = payload.get("grant_types") or ["authorization_code", "refresh_token"]
         response_types = payload.get("response_types") or ["code"]
         if not _string_list(grant_types) or not _string_list(response_types):
-            return _registration_error(
-                "invalid_client_metadata",
-                "grant_types and response_types must be string arrays.",
+            return finish(
+                _registration_error(
+                    "invalid_client_metadata",
+                    "grant_types and response_types must be string arrays.",
+                )
             )
         if "authorization_code" not in grant_types:
-            return _registration_error(
-                "invalid_client_metadata",
-                "grant_types must include authorization_code.",
+            return finish(
+                _registration_error(
+                    "invalid_client_metadata",
+                    "grant_types must include authorization_code.",
+                )
             )
         if any(
             grant_type not in {"authorization_code", "refresh_token"}
             for grant_type in grant_types
         ):
-            return _registration_error(
-                "invalid_client_metadata",
-                "Only authorization_code and refresh_token grants are supported.",
+            return finish(
+                _registration_error(
+                    "invalid_client_metadata",
+                    "Only authorization_code and refresh_token grants are supported.",
+                )
             )
         if "code" not in response_types:
-            return _registration_error(
-                "invalid_client_metadata",
-                "response_types must include code.",
+            return finish(
+                _registration_error(
+                    "invalid_client_metadata",
+                    "response_types must include code.",
+                )
             )
 
         scope = payload.get("scope") or " ".join(SUPPORTED_OAUTH_SCOPES)
         if not isinstance(scope, str):
-            return _registration_error("invalid_client_metadata", "scope must be a string.")
+            return finish(_registration_error("invalid_client_metadata", "scope must be a string."))
         scopes = _scope_list(scope)
         if READ_SCOPE not in scopes:
-            return _registration_error(
-                "invalid_client_metadata",
-                f"scope must include {READ_SCOPE}.",
+            return finish(
+                _registration_error(
+                    "invalid_client_metadata",
+                    f"scope must include {READ_SCOPE}.",
+                )
             )
         if not set(scopes).issubset(SUPPORTED_OAUTH_SCOPES):
-            return _registration_error(
-                "invalid_client_metadata",
-                "Requested scopes are not supported.",
+            return finish(
+                _registration_error(
+                    "invalid_client_metadata",
+                    "Requested scopes are not supported.",
+                )
             )
 
         client_secret = None
@@ -896,7 +928,9 @@ class McpOAuthServer(TokenVerifier):
         client_id = f"mcp-client-{secrets.token_urlsafe(24)}"
         client_name = payload.get("client_name")
         if client_name is not None and not isinstance(client_name, str):
-            return _registration_error("invalid_client_metadata", "client_name must be a string.")
+            return finish(
+                _registration_error("invalid_client_metadata", "client_name must be a string.")
+            )
 
         client = RegisteredClient(
             client_id=client_id,
@@ -913,7 +947,7 @@ class McpOAuthServer(TokenVerifier):
         )
         self.store.save_client(client)
 
-        response_payload: dict[str, Any] = {
+        response_payload = {
             "client_id": client_id,
             "client_id_issued_at": now,
             "redirect_uris": normalized_redirects,
@@ -928,7 +962,7 @@ class McpOAuthServer(TokenVerifier):
             response_payload["client_secret"] = client_secret
             response_payload["client_secret_expires_at"] = client_secret_expires_at
 
-        return _json_response(response_payload, status_code=201, headers=NO_STORE_HEADERS)
+        return finish(_json_response(response_payload, status_code=201, headers=NO_STORE_HEADERS))
 
     async def authorize(self, request: Request) -> Response:
         params = await _request_params(request)
@@ -937,13 +971,22 @@ class McpOAuthServer(TokenVerifier):
 
         validation_error = self._validate_authorization_params(params, client)
         if validation_error:
-            return self._authorization_error_response(
+            response = self._authorization_error_response(
                 client=client,
                 redirect_uri=params.get("redirect_uri"),
                 state=state,
                 error=validation_error[0],
                 description=validation_error[1],
             )
+            self._log_authorize_diagnostic(
+                request,
+                response,
+                params,
+                client,
+                validation_error=validation_error[0],
+                next_step="error",
+            )
+            return response
 
         assert client is not None
         requested_scopes = _requested_authorization_scopes(params.get("scope"), client)
@@ -961,17 +1004,35 @@ class McpOAuthServer(TokenVerifier):
         self.store.save_pending_authorization(pending)
 
         if self._authenticated_owner(request) is not None:
-            return RedirectResponse(
+            response = RedirectResponse(
                 url=f"{OWNER_APPROVE_PATH}?request={pending.request_id}",
                 status_code=302,
                 headers=NO_STORE_HEADERS,
             )
+            self._log_authorize_diagnostic(
+                request,
+                response,
+                params,
+                client,
+                validation_error=None,
+                next_step="owner_approve",
+            )
+            return response
 
-        return RedirectResponse(
+        response = RedirectResponse(
             url=f"{OWNER_LOGIN_PATH}?request={pending.request_id}",
             status_code=302,
             headers=NO_STORE_HEADERS,
         )
+        self._log_authorize_diagnostic(
+            request,
+            response,
+            params,
+            client,
+            validation_error=None,
+            next_step="owner_login",
+        )
+        return response
 
     async def owner_login(self, request: Request) -> Response:
         if request.method == "GET":
@@ -1444,6 +1505,68 @@ class McpOAuthServer(TokenVerifier):
             and (record.expires_at is None or record.expires_at >= int(time.time()))
         )
 
+    def _log_register_diagnostic(
+        self,
+        request: Request,
+        response: Response,
+        payload: object | None,
+        response_payload: Mapping[str, Any] | None,
+    ) -> None:
+        if not _oauth_diagnostics_enabled():
+            return
+        request_fields = _register_request_diagnostic_fields(payload)
+        response_fields = _register_response_diagnostic_fields(response_payload)
+        self._logger.warning(
+            json.dumps(
+                {
+                    "event": "mcp_oauth_register",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    **request_fields,
+                    **response_fields,
+                },
+                sort_keys=True,
+            )
+        )
+
+    def _log_authorize_diagnostic(
+        self,
+        request: Request,
+        response: Response,
+        params: Mapping[str, str],
+        client: RegisteredClient | None,
+        *,
+        validation_error: str | None,
+        next_step: str,
+    ) -> None:
+        if not _oauth_diagnostics_enabled():
+            return
+        self._logger.warning(
+            json.dumps(
+                {
+                    "event": "mcp_oauth_authorize",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "client_id_present": bool(params.get("client_id")),
+                    "client_registered": client is not None,
+                    "code_challenge_method": _diagnostic_string(
+                        params.get("code_challenge_method")
+                    ),
+                    "code_challenge_present": bool(params.get("code_challenge")),
+                    "next_step": next_step,
+                    "redirect_uri": _diagnostic_string(params.get("redirect_uri")),
+                    "requested_scopes": _scope_list(params.get("scope", "")),
+                    "resource": _diagnostic_string(params.get("resource")),
+                    "response_type": _diagnostic_string(params.get("response_type")),
+                    "state_present": bool(params.get("state")),
+                    "validation_error": validation_error,
+                },
+                sort_keys=True,
+            )
+        )
+
 
 class OAuthClientAuthError(Exception):
     def __init__(self, message: str) -> None:
@@ -1472,6 +1595,109 @@ def _scope_list(scope: str) -> list[str]:
 
 def _string_list(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _oauth_diagnostics_enabled() -> bool:
+    value = os.getenv(GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS_ENV_VAR)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _register_request_diagnostic_fields(payload: object | None) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "request_client_name": None,
+        "request_grant_types": None,
+        "request_payload_type": _diagnostic_type(payload),
+        "request_redirect_uris": None,
+        "request_response_types": None,
+        "request_scopes": None,
+        "request_software_id": None,
+        "request_token_endpoint_auth_method": None,
+    }
+    if not isinstance(payload, dict):
+        return fields
+
+    scope = payload.get("scope")
+    fields.update(
+        {
+            "request_client_name": _diagnostic_string(payload.get("client_name")),
+            "request_grant_types": _diagnostic_string_list(payload.get("grant_types")),
+            "request_redirect_uris": _diagnostic_string_list(payload.get("redirect_uris")),
+            "request_response_types": _diagnostic_string_list(payload.get("response_types")),
+            "request_scopes": _scope_list(scope) if isinstance(scope, str) else None,
+            "request_software_id": _diagnostic_string(payload.get("software_id")),
+            "request_token_endpoint_auth_method": _diagnostic_string(
+                payload.get("token_endpoint_auth_method")
+            ),
+        }
+    )
+    return fields
+
+
+def _register_response_diagnostic_fields(
+    response_payload: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "response_client_id_issued": False,
+        "response_client_secret_issued": False,
+        "response_grant_types": None,
+        "response_redirect_uris": None,
+        "response_response_types": None,
+        "response_scopes": None,
+        "response_token_endpoint_auth_method": None,
+    }
+    if response_payload is None:
+        return fields
+
+    scope = response_payload.get("scope")
+    fields.update(
+        {
+            "response_client_id_issued": isinstance(response_payload.get("client_id"), str),
+            "response_client_secret_issued": isinstance(
+                response_payload.get("client_secret"),
+                str,
+            ),
+            "response_grant_types": _diagnostic_string_list(
+                response_payload.get("grant_types")
+            ),
+            "response_redirect_uris": _diagnostic_string_list(
+                response_payload.get("redirect_uris")
+            ),
+            "response_response_types": _diagnostic_string_list(
+                response_payload.get("response_types")
+            ),
+            "response_scopes": _scope_list(scope) if isinstance(scope, str) else None,
+            "response_token_endpoint_auth_method": _diagnostic_string(
+                response_payload.get("token_endpoint_auth_method")
+            ),
+        }
+    )
+    return fields
+
+
+def _diagnostic_string(value: object, *, max_length: int = 200) -> str | None:
+    return value[:max_length] if isinstance(value, str) else None
+
+
+def _diagnostic_string_list(value: object) -> list[str] | None:
+    if not _string_list(value):
+        return None
+    return [_diagnostic_string(item) or "" for item in value]
+
+
+def _diagnostic_type(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int | float):
+        return "number"
+    return type(value).__name__
 
 
 def _form_string(form: Mapping[str, Any], name: str) -> str:
