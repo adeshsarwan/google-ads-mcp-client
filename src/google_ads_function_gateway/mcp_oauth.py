@@ -48,6 +48,7 @@ DEFAULT_AUTH_CODE_TTL_SECONDS = 300
 DEFAULT_REFRESH_TOKEN_TTL_SECONDS = 2_592_000
 DEFAULT_OWNER_SESSION_TTL_SECONDS = 900
 GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS_ENV_VAR = "GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS"
+POST_APPROVAL_REDIRECT_STATUS_CODE = 303
 
 SESSION_COOKIE = "google_ads_mcp_owner_session"
 CSRF_COOKIE = "google_ads_mcp_csrf"
@@ -59,16 +60,22 @@ NO_STORE_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 
-HTML_SECURITY_HEADERS = {
-    **NO_STORE_HEADERS,
-    "Content-Security-Policy": (
-        "default-src 'none'; "
-        "style-src 'unsafe-inline'; "
-        "form-action 'self'; "
-        "base-uri 'none'; "
-        "frame-ancestors 'none'"
-    ),
-}
+
+def _html_security_headers(*, form_action_origins: tuple[str, ...] = ()) -> dict[str, str]:
+    form_action_sources = " ".join(("'self'", *form_action_origins))
+    return {
+        **NO_STORE_HEADERS,
+        "Content-Security-Policy": (
+            "default-src 'none'; "
+            "style-src 'unsafe-inline'; "
+            f"form-action {form_action_sources}; "
+            "base-uri 'none'; "
+            "frame-ancestors 'none'"
+        ),
+    }
+
+
+HTML_SECURITY_HEADERS = _html_security_headers()
 
 
 @dataclass(frozen=True)
@@ -1120,7 +1127,7 @@ class McpOAuthServer(TokenVerifier):
                     state=pending.state,
                     iss=self.settings.issuer_url,
                 ),
-                status_code=302,
+                status_code=POST_APPROVAL_REDIRECT_STATUS_CODE,
                 headers=NO_STORE_HEADERS,
             )
 
@@ -1139,7 +1146,7 @@ class McpOAuthServer(TokenVerifier):
                 state=pending.state,
                 iss=self.settings.issuer_url,
             ),
-            status_code=302,
+            status_code=POST_APPROVAL_REDIRECT_STATUS_CODE,
             headers=NO_STORE_HEADERS,
         )
 
@@ -1413,6 +1420,7 @@ class McpOAuthServer(TokenVerifier):
         csrf = secrets.token_urlsafe(32)
         client_name = client.client_name if client and client.client_name else pending.client_id
         message = f"<p class=\"error\">{html.escape(error)}</p>" if error else ""
+        form_action_origins = _redirect_uri_form_action_origins(pending.redirect_uri)
         response = HTMLResponse(
             _html_document(
                 "Approve Google Ads MCP access",
@@ -1432,7 +1440,7 @@ class McpOAuthServer(TokenVerifier):
                 </form>
                 """,
             ),
-            headers=HTML_SECURITY_HEADERS,
+            headers=_html_security_headers(form_action_origins=form_action_origins),
         )
         _set_csrf_cookie(response, csrf)
         return response
@@ -1716,6 +1724,15 @@ def _is_safe_redirect_uri(value: str) -> bool:
     if parsed.scheme == "http":
         return parsed.hostname in {"127.0.0.1", "localhost", "::1"}
     return False
+
+
+def _redirect_uri_form_action_origins(redirect_uri: str) -> tuple[str, ...]:
+    parsed = urlparse(redirect_uri)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ()
+    if parsed.username or parsed.password:
+        return ()
+    return (urlunparse((parsed.scheme, parsed.netloc, "", "", "", "")),)
 
 
 def _s256_challenge(code_verifier: str) -> str:

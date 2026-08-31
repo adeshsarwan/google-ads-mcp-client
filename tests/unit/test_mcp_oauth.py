@@ -288,10 +288,129 @@ class McpOAuthTests(unittest.TestCase):
         self.assertEqual(login_page.status_code, 200)
         self.assertEqual(login.status_code, 302)
         self.assertTrue(login.headers["location"].startswith("/oauth/owner/approve"))
-        self.assertEqual(approval.status_code, 302)
+        self.assertEqual(approval.status_code, 303)
         self.assertTrue(approval.headers["location"].startswith(REDIRECT_URI))
         self.assertEqual(_query_value(approval.headers["location"], "state"), "unit-state")
         self.assertEqual(_query_value(approval.headers["location"], "iss"), PUBLIC_ORIGIN)
+
+    def test_owner_approval_post_uses_see_other_and_get_callback_parameters(self) -> None:
+        app, oauth_server, _ = self._build_oauth_app()
+
+        with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
+            registered = _register_client(client)
+            pending = _start_owner_approval(client, client_id=registered["client_id"])
+            auth_codes_before = _oauth_table_count(oauth_server, "authorization_codes")
+            grants_before = _oauth_table_count(oauth_server, "oauth_grants")
+
+            invalid_csrf = client.post(
+                "/oauth/owner/approve",
+                data={
+                    "request": pending["request_id"],
+                    "csrf_token": "invalid-csrf",
+                    "decision": "approve",
+                },
+                headers={"Host": PUBLIC_HOST},
+                follow_redirects=False,
+            )
+            auth_codes_after_invalid_csrf = _oauth_table_count(
+                oauth_server,
+                "authorization_codes",
+            )
+            pending_after_invalid_csrf = _oauth_table_count(
+                oauth_server,
+                "oauth_pending_authorizations",
+            )
+
+            approval = client.post(
+                "/oauth/owner/approve",
+                data={
+                    "request": pending["request_id"],
+                    "csrf_token": _csrf_token(invalid_csrf.text),
+                    "decision": "approve",
+                },
+                headers={"Host": PUBLIC_HOST},
+                follow_redirects=False,
+            )
+            repeat = client.post(
+                "/oauth/owner/approve",
+                data={
+                    "request": pending["request_id"],
+                    "csrf_token": _csrf_token(invalid_csrf.text),
+                    "decision": "approve",
+                },
+                headers={"Host": PUBLIC_HOST},
+                follow_redirects=False,
+            )
+
+        location = approval.headers["location"]
+        callback = urlparse(location)
+        callback_params = parse_qs(callback.query)
+
+        self.assertEqual(invalid_csrf.status_code, 200)
+        self.assertIn("The form expired. Try again.", invalid_csrf.text)
+        self.assertEqual(auth_codes_after_invalid_csrf, auth_codes_before)
+        self.assertEqual(pending_after_invalid_csrf, 1)
+
+        self.assertIn("form-action 'self' https://chat.openai.com;", pending["approval_csp"])
+        self.assertNotIn("*", pending["approval_csp"])
+        self.assertNotIn("form-action 'self' https:;", pending["approval_csp"])
+
+        self.assertEqual(approval.status_code, 303)
+        self.assertEqual(f"{callback.scheme}://{callback.netloc}{callback.path}", REDIRECT_URI)
+        self.assertEqual(callback_params["state"], ["unit-state"])
+        self.assertEqual(callback_params["iss"], [PUBLIC_ORIGIN])
+        self.assertEqual(len(callback_params["code"]), 1)
+        self.assertEqual(
+            _oauth_table_count(oauth_server, "authorization_codes"),
+            auth_codes_before + 1,
+        )
+        self.assertEqual(_oauth_table_count(oauth_server, "oauth_grants"), grants_before + 1)
+        self.assertEqual(_oauth_table_count(oauth_server, "oauth_pending_authorizations"), 0)
+        self.assertIsNone(oauth_server.store.get_pending_authorization(pending["request_id"]))
+
+        self.assertEqual(repeat.status_code, 400)
+        self.assertEqual(
+            _oauth_table_count(oauth_server, "authorization_codes"),
+            auth_codes_before + 1,
+        )
+
+    def test_owner_denial_post_uses_see_other_without_authorization_code(self) -> None:
+        app, oauth_server, _ = self._build_oauth_app()
+
+        with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
+            registered = _register_client(client)
+            pending = _start_owner_approval(client, client_id=registered["client_id"])
+            auth_codes_before = _oauth_table_count(oauth_server, "authorization_codes")
+            grants_before = _oauth_table_count(oauth_server, "oauth_grants")
+
+            denial = client.post(
+                "/oauth/owner/approve",
+                data={
+                    "request": pending["request_id"],
+                    "csrf_token": pending["csrf_token"],
+                    "decision": "deny",
+                },
+                headers={"Host": PUBLIC_HOST},
+                follow_redirects=False,
+            )
+
+        location = denial.headers["location"]
+        callback = urlparse(location)
+        callback_params = parse_qs(callback.query)
+
+        self.assertEqual(denial.status_code, 303)
+        self.assertEqual(f"{callback.scheme}://{callback.netloc}{callback.path}", REDIRECT_URI)
+        self.assertEqual(callback_params["error"], ["access_denied"])
+        self.assertEqual(callback_params["state"], ["unit-state"])
+        self.assertEqual(callback_params["iss"], [PUBLIC_ORIGIN])
+        self.assertNotIn("code", callback_params)
+        self.assertEqual(
+            _oauth_table_count(oauth_server, "authorization_codes"),
+            auth_codes_before,
+        )
+        self.assertEqual(_oauth_table_count(oauth_server, "oauth_grants"), grants_before)
+        self.assertEqual(_oauth_table_count(oauth_server, "oauth_pending_authorizations"), 0)
+        self.assertIsNone(oauth_server.store.get_pending_authorization(pending["request_id"]))
 
     def test_oauth_and_metadata_routes_reject_hostile_host_without_origin_policy(self) -> None:
         app, _, _ = self._build_oauth_app()
@@ -1102,14 +1221,21 @@ def _register_client(client: TestClient) -> dict[str, Any]:
     return response.json()
 
 
-def _authorize_owner(client: TestClient, *, client_id: str, scope: str) -> dict[str, str]:
-    verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~abc"
+def _start_owner_approval(
+    client: TestClient,
+    *,
+    client_id: str,
+    scope: str = f"{READ_SCOPE} {OFFLINE_ACCESS_SCOPE}",
+    verifier: str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~abc",
+) -> dict[str, str]:
     response = _authorization_request(client, client_id, scope=scope, verifier=verifier)
     if response.status_code != 302:
         raise AssertionError(response.text)
     request_id = _query_value(response.headers["location"], "request")
 
     login_page = client.get(response.headers["location"], headers={"Host": PUBLIC_HOST})
+    if login_page.status_code != 200:
+        raise AssertionError(login_page.text)
     login_response = client.post(
         "/oauth/owner/login",
         data={
@@ -1125,17 +1251,29 @@ def _authorize_owner(client: TestClient, *, client_id: str, scope: str) -> dict[
         raise AssertionError(login_response.text)
 
     approval_page = client.get(login_response.headers["location"], headers={"Host": PUBLIC_HOST})
+    if approval_page.status_code != 200:
+        raise AssertionError(approval_page.text)
+    return {
+        "request_id": request_id,
+        "csrf_token": _csrf_token(approval_page.text),
+        "approval_csp": approval_page.headers["content-security-policy"],
+        "verifier": verifier,
+    }
+
+
+def _authorize_owner(client: TestClient, *, client_id: str, scope: str) -> dict[str, str]:
+    pending = _start_owner_approval(client, client_id=client_id, scope=scope)
     approval_response = client.post(
         "/oauth/owner/approve",
         data={
-            "request": request_id,
-            "csrf_token": _csrf_token(approval_page.text),
+            "request": pending["request_id"],
+            "csrf_token": pending["csrf_token"],
             "decision": "approve",
         },
         headers={"Host": PUBLIC_HOST},
         follow_redirects=False,
     )
-    if approval_response.status_code != 302:
+    if approval_response.status_code != 303:
         raise AssertionError(approval_response.text)
 
     location = approval_response.headers["location"]
@@ -1143,7 +1281,7 @@ def _authorize_owner(client: TestClient, *, client_id: str, scope: str) -> dict[
         "code": _query_value(location, "code"),
         "state": _query_value(location, "state"),
         "iss": _query_value(location, "iss"),
-        "verifier": verifier,
+        "verifier": pending["verifier"],
     }
 
 
