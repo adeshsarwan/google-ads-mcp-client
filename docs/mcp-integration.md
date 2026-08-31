@@ -130,6 +130,15 @@ tool definitions must be visible without exposing Google Ads data. Google Ads
 catalogue execution still requires a valid MCP OAuth token and preserves the
 existing customer allow-list.
 
+Some ChatGPT Business discovery runs first send an unauthenticated empty
+`POST /mcp` reachability probe with `Content-Length: 0`. This service answers
+only that exact empty probe with `204 No Content` so discovery can continue to
+OAuth metadata and MCP tool listing. The response is not an MCP JSON-RPC message,
+does not create a session, does not issue OAuth tokens, and does not execute any
+Google Ads function. Empty posts with authorization, MCP session/protocol
+headers, malformed JSON, JSON-RPC arrays, or non-empty bodies continue through
+the SDK's strict validation path.
+
 ## Static Bearer Fallback
 
 The old bearer-token transport gate remains available only as an explicit fallback:

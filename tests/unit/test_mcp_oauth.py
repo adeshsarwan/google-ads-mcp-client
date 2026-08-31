@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -651,6 +652,127 @@ class McpOAuthTests(unittest.TestCase):
             {name: expected_status for name, _, _, expected_status in variants},
         )
 
+    def test_chatgpt_empty_post_probe_returns_no_content_without_side_effects(self) -> None:
+        catalogue = _FakeCatalogue(_success_response("list_accounts", []))
+        app, oauth_server, _ = self._build_oauth_app(catalogue)
+
+        with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
+            token_rows_before = _oauth_table_count(oauth_server, "oauth_tokens")
+            probe = _chatgpt_empty_probe(client)
+            token_rows_after_probe = _oauth_table_count(oauth_server, "oauth_tokens")
+            initialize = _initialize_mcp(client)
+            session_id = initialize.headers["mcp-session-id"]
+            tools = _mcp_request(
+                client,
+                "",
+                session_id,
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            )
+            protected_call = _mcp_request(
+                client,
+                "",
+                session_id,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "list_accounts", "arguments": {}},
+                },
+            )
+
+        self.assertEqual(probe.status_code, 204)
+        self.assertEqual(probe.content, b"")
+        self.assertNotIn("mcp-session-id", probe.headers)
+        self.assertEqual(token_rows_after_probe, token_rows_before)
+
+        self.assertEqual(initialize.status_code, 200)
+        self.assertEqual(tools.status_code, 200)
+        tool_names = sorted(tool["name"] for tool in _sse_json(tools)["result"]["tools"])
+        self.assertEqual(tool_names, EXPECTED_TOOLS)
+
+        self.assertEqual(protected_call.status_code, 200)
+        call_body = _sse_json(protected_call)
+        self.assertTrue(call_body["result"]["isError"])
+        self.assertEqual(
+            call_body["result"]["structuredContent"]["error"]["code"],
+            "invalid_token",
+        )
+        self.assertEqual(catalogue.calls, [])
+        self.assertEqual(_oauth_table_count(oauth_server, "oauth_tokens"), token_rows_before)
+
+    def test_empty_post_probe_nearby_malformed_requests_stay_strict(self) -> None:
+        app, oauth_server, _ = self._build_oauth_app()
+        access_token = oauth_server.issue_test_token(
+            client_id="unit-client",
+            scopes=[READ_SCOPE],
+        )
+
+        with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
+            responses = {
+                "empty_with_authorization": _chatgpt_empty_probe(
+                    client,
+                    authorization=f"Bearer {access_token}",
+                ),
+                "empty_with_session": _chatgpt_empty_probe(
+                    client,
+                    extra_headers={"mcp-session-id": "unit-session"},
+                ),
+                "empty_with_protocol": _chatgpt_empty_probe(
+                    client,
+                    extra_headers={"MCP-Protocol-Version": "2025-06-18"},
+                ),
+                "malformed_json": client.post(
+                    "/mcp",
+                    headers={
+                        "Host": PUBLIC_HOST,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                    content=b"{",
+                ),
+                "json_array_batch": client.post(
+                    "/mcp",
+                    headers={
+                        "Host": PUBLIC_HOST,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                    },
+                    json=[
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": {},
+                                "clientInfo": {"name": "unit-test", "version": "0"},
+                            },
+                        }
+                    ],
+                ),
+                "non_empty_octet_stream": client.post(
+                    "/mcp",
+                    headers={
+                        "Host": PUBLIC_HOST,
+                        "Content-Type": "application/octet-stream",
+                        "Accept": "*/*",
+                    },
+                    content=b"not-json",
+                ),
+            }
+
+        self.assertEqual(
+            {name: int(response.status_code) for name, response in responses.items()},
+            {
+                "empty_with_authorization": 400,
+                "empty_with_session": 404,
+                "empty_with_protocol": 400,
+                "malformed_json": 400,
+                "json_array_batch": 400,
+                "non_empty_octet_stream": 400,
+            },
+        )
+
     def test_oauth_env_configuration_defaults_for_remote_http(self) -> None:
         env = {
             "GOOGLE_ADS_MCP_PUBLIC_HOST": PUBLIC_HOST,
@@ -911,6 +1033,25 @@ def _initialize_payload() -> dict[str, Any]:
     }
 
 
+def _chatgpt_empty_probe(
+    client: TestClient,
+    *,
+    authorization: str | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
+    headers = {
+        "Host": PUBLIC_HOST,
+        "Content-Length": "0",
+        "Content-Type": "application/octet-stream",
+        "Accept": "*/*",
+        "User-Agent": "Python/3.13 aiohttp/3.13.5",
+        **(extra_headers or {}),
+    }
+    if authorization:
+        headers["Authorization"] = authorization
+    return client.post("/mcp", headers=headers, content=b"")
+
+
 def _mcp_request(
     client: TestClient,
     access_token: str,
@@ -938,6 +1079,15 @@ def _sse_json(response: Any) -> dict[str, Any]:
         if line.startswith("data: "):
             return json.loads(line[6:])
     raise AssertionError(response.text)
+
+
+def _oauth_table_count(oauth_server: McpOAuthServer, table_name: str) -> int:
+    conn = sqlite3.connect(oauth_server.store.db_path)
+    try:
+        cursor = conn.execute(f"SELECT COUNT(*) FROM {table_name}")
+        return int(cursor.fetchone()[0])
+    finally:
+        conn.close()
 
 
 def _csrf_token(body: str) -> str:

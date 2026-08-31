@@ -237,6 +237,14 @@ Ads catalogue still requires a valid MCP OAuth access token with `google_ads.rea
 missing, invalid, or under-scoped tokens return an MCP auth challenge via
 `_meta["mcp/www_authenticate"]` and do not execute Google Ads code.
 
+ChatGPT Business Custom App discovery may first send an unauthenticated empty
+`POST /mcp` reachability probe with `Content-Length: 0` before it fetches OAuth
+metadata or sends MCP JSON-RPC. The server answers only that exact empty probe
+with `204 No Content`. It does not create an MCP session, authenticate the
+request, issue OAuth tokens, or execute tools. Any POST containing MCP headers,
+authorization, a session ID, malformed JSON, a JSON-RPC batch, or a non-empty
+body continues through the SDK's strict MCP validation path.
+
 OAuth owner approval happens on server-hosted login and approval pages. The password
 stored in `.env` must be an Argon2id hash in `GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH`;
 do not put a plaintext owner password in `.env`.

@@ -197,6 +197,34 @@ class OptionalOAuthContextMiddleware:
             auth_context_var.reset(context_token)
 
 
+class EmptyMcpPostProbeMiddleware:
+    """Handle ChatGPT's empty unauthenticated MCP reachability probe."""
+
+    def __init__(self, app: ASGIApp, path: str) -> None:
+        self.app = app
+        self._path = path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _is_empty_mcp_post_probe_candidate(
+            scope,
+            path=self._path,
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        messages, body = await _buffer_http_request(receive)
+        if body == b"":
+            await _send_no_content(send)
+            return
+
+        async def replay_receive() -> Message:
+            if messages:
+                return messages.popleft()
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+
 class HttpDiagnosticsMiddleware:
     """Emit opt-in, secret-free HTTP/MCP diagnostics to stderr logging."""
 
@@ -211,17 +239,7 @@ class HttpDiagnosticsMiddleware:
 
         started_at = time.perf_counter()
         status_code: int | None = None
-        messages: deque[Message] = deque()
-
-        while True:
-            message = await receive()
-            messages.append(message)
-            if message["type"] != "http.request" or not message.get("more_body", False):
-                break
-
-        body = b"".join(
-            message.get("body", b"") for message in messages if message["type"] == "http.request"
-        )
+        messages, body = await _buffer_http_request(receive)
         diagnostic_fields = _mcp_diagnostic_fields(scope, body)
 
         async def replay_receive() -> Message:
@@ -480,6 +498,7 @@ def build_streamable_http_app(
         app = BearerTokenAuthMiddleware(app, settings.auth_token)
     if settings.auth_mode == OAUTH_AUTH_MODE and oauth_server is not None:
         app = OptionalOAuthContextMiddleware(app, oauth_server)
+    app = EmptyMcpPostProbeMiddleware(app, settings.path)
     app = HostOriginSecurityMiddleware(app, transport_security)
     if settings.http_diagnostics:
         app = HttpDiagnosticsMiddleware(app)
@@ -762,6 +781,52 @@ def _header_value(scope: Scope, name: bytes) -> bytes | None:
     return None
 
 
+def _has_header(scope: Scope, name: bytes) -> bool:
+    return any(key.lower() == name for key, _ in scope.get("headers", []))
+
+
+async def _buffer_http_request(receive: Receive) -> tuple[deque[Message], bytes]:
+    messages: deque[Message] = deque()
+
+    while True:
+        message = await receive()
+        messages.append(message)
+        if message["type"] != "http.request" or not message.get("more_body", False):
+            break
+
+    body = b"".join(
+        message.get("body", b"") for message in messages if message["type"] == "http.request"
+    )
+    return messages, body
+
+
+def _is_empty_mcp_post_probe_candidate(scope: Scope, *, path: str) -> bool:
+    if scope.get("method") != "POST" or scope.get("path") != path:
+        return False
+    if not _content_length_is_zero(scope):
+        return False
+    return not any(
+        _has_header(scope, header_name)
+        for header_name in (
+            b"authorization",
+            b"mcp-session-id",
+            b"mcp-protocol-version",
+            b"mcp-method",
+            b"mcp-name",
+        )
+    )
+
+
+def _content_length_is_zero(scope: Scope) -> bool:
+    content_length = _header_value(scope, b"content-length")
+    if content_length is None:
+        return False
+    try:
+        return int(content_length.decode("ascii").strip()) == 0
+    except ValueError:
+        return False
+
+
 def _bearer_token_from_scope(scope: Scope) -> str | None:
     authorization = _header_value(scope, b"authorization")
     if not authorization:
@@ -877,6 +942,17 @@ async def _send_auth_error(send: Send) -> None:
         }
     )
     await send({"type": "http.response.body", "body": body})
+
+
+async def _send_no_content(send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 204,
+            "headers": [],
+        }
+    )
+    await send({"type": "http.response.body", "body": b""})
 
 
 if __name__ == "__main__":
