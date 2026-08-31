@@ -8,12 +8,16 @@ import json
 import logging
 import os
 import sys
+import time
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import mcp_types as mcp_types
+from mcp.server.auth.middleware.auth_context import auth_context_var, get_access_token
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from starlette.requests import Request
@@ -31,6 +35,7 @@ DEFAULT_STREAMABLE_HTTP_PATH = "/mcp"
 GOOGLE_ADS_MCP_PUBLIC_HOST_ENV_VAR = "GOOGLE_ADS_MCP_PUBLIC_HOST"
 GOOGLE_ADS_MCP_PUBLIC_ORIGIN_ENV_VAR = "GOOGLE_ADS_MCP_PUBLIC_ORIGIN"
 GOOGLE_ADS_MCP_AUTH_MODE_ENV_VAR = "GOOGLE_ADS_MCP_AUTH_MODE"
+GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS_ENV_VAR = "GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS"
 DEFAULT_HTTP_AUTH_MODE = "oauth"
 STATIC_BEARER_AUTH_MODE = "static_bearer"
 OAUTH_AUTH_MODE = "oauth"
@@ -63,6 +68,7 @@ class McpRuntimeSettings:
     public_host: str | None = None
     public_origin: str | None = None
     auth_mode: str = DEFAULT_HTTP_AUTH_MODE
+    http_diagnostics: bool = False
 
     @classmethod
     def from_env(
@@ -99,6 +105,7 @@ class McpRuntimeSettings:
             public_host=public_host,
             public_origin=public_origin,
             auth_mode=resolved_auth_mode,
+            http_diagnostics=_bool_from_env(GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS_ENV_VAR),
         )
 
     @property
@@ -161,36 +168,91 @@ class HostOriginSecurityMiddleware:
         await self.app(scope, receive, send)
 
 
-class OAuthChallengeScopeMiddleware:
-    """Add the required MCP scope to SDK OAuth challenges for client discovery."""
+class OptionalOAuthContextMiddleware:
+    """Attach verified OAuth context to tool requests without blocking tool discovery."""
 
-    def __init__(self, app: ASGIApp, required_scope: str) -> None:
+    def __init__(self, app: ASGIApp, oauth_server: McpOAuthServer) -> None:
         self.app = app
-        self._scope_fragment = f', scope="{required_scope}"'.encode()
+        self._oauth_server = oauth_server
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        async def send_with_scope(message: Message) -> None:
-            if message["type"] == "http.response.start" and message["status"] in {401, 403}:
-                message = dict(message)
-                headers = list(message.get("headers", []))
-                message["headers"] = [
-                    self._challenge_with_scope(name, value)
-                    for name, value in headers
-                ]
+        bearer_token = _bearer_token_from_scope(scope)
+        if not bearer_token:
+            await self.app(scope, receive, send)
+            return
+
+        access_token = await self._oauth_server.verify_token(bearer_token)
+        if access_token is None:
+            await self.app(scope, receive, send)
+            return
+
+        context_token = auth_context_var.set(AuthenticatedUser(access_token))
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            auth_context_var.reset(context_token)
+
+
+class HttpDiagnosticsMiddleware:
+    """Emit opt-in, secret-free HTTP/MCP diagnostics to stderr logging."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self._logger = logging.getLogger(__name__)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started_at = time.perf_counter()
+        status_code: int | None = None
+        messages: deque[Message] = deque()
+
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] != "http.request" or not message.get("more_body", False):
+                break
+
+        body = b"".join(
+            message.get("body", b"") for message in messages if message["type"] == "http.request"
+        )
+        mcp_method, request_id = _mcp_diagnostic_fields(body)
+
+        async def replay_receive() -> Message:
+            if messages:
+                return messages.popleft()
+            return await receive()
+
+        async def capture_send(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
             await send(message)
 
-        await self.app(scope, receive, send_with_scope)
-
-    def _challenge_with_scope(self, name: bytes, value: bytes) -> tuple[bytes, bytes]:
-        if name.lower() != b"www-authenticate":
-            return name, value
-        if not value.startswith(b"Bearer") or b"scope=" in value:
-            return name, value
-        return name, value + self._scope_fragment
+        try:
+            await self.app(scope, replay_receive, capture_send)
+        finally:
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            self._logger.warning(
+                json.dumps(
+                    {
+                        "duration_ms": duration_ms,
+                        "event": "mcp_http_request",
+                        "method": scope.get("method"),
+                        "mcp_method": mcp_method,
+                        "path": scope.get("path"),
+                        "request_id": request_id,
+                        "status": status_code,
+                    },
+                    sort_keys=True,
+                )
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -212,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
     if runtime_settings.transport == "stdio":
         server.run("stdio")
     else:
-        run_streamable_http_server(server, runtime_settings)
+        run_streamable_http_server(server, runtime_settings, oauth_server=oauth_server)
     return 0
 
 
@@ -255,12 +317,6 @@ def build_mcp_server(
 
     load_local_env()
     active_catalogue = catalogue or GoogleAdsFunctionCatalogue.from_settings()
-    auth_kwargs: dict[str, Any] = {}
-    if oauth_server is not None:
-        auth_kwargs = {
-            "auth": oauth_server.settings.auth_settings(),
-            "token_verifier": oauth_server,
-        }
     server = MCPServer(
         name=SERVER_NAME,
         title="Google Ads Function Gateway",
@@ -271,33 +327,42 @@ def build_mcp_server(
         ),
         version="0.1.0",
         log_level="WARNING",
-        **auth_kwargs,
     )
+
+    def call_catalogue(function_name: str, params: Mapping[str, Any]) -> mcp_types.CallToolResult:
+        return invoke_authorized_catalogue_tool(
+            active_catalogue,
+            oauth_server,
+            function_name,
+            params,
+        )
 
     @server.tool(
         name="list_accounts",
+        title="List Google Ads Accounts",
         description="Discover accessible Google Ads accounts using the configured MCC context.",
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         meta=OAUTH_TOOL_META if oauth_server is not None else None,
     )
     def list_accounts() -> mcp_types.CallToolResult:
-        return invoke_catalogue_tool(active_catalogue, "list_accounts", {})
+        return call_catalogue("list_accounts", {})
 
     @server.tool(
         name="get_account_details",
+        title="Get Google Ads Account Details",
         description="Return details for one explicitly allow-listed Google Ads customer.",
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         meta=OAUTH_TOOL_META if oauth_server is not None else None,
     )
     def get_account_details(customer_id: str) -> mcp_types.CallToolResult:
-        return invoke_catalogue_tool(
-            active_catalogue,
+        return call_catalogue(
             "get_account_details",
             {"customer_id": customer_id},
         )
 
     @server.tool(
         name="list_campaigns",
+        title="List Google Ads Campaigns",
         description="List campaigns for one explicitly allow-listed Google Ads customer.",
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         meta=OAUTH_TOOL_META if oauth_server is not None else None,
@@ -309,8 +374,7 @@ def build_mcp_server(
         campaign_name_contains: str | None = None,
         channel_type: str | None = None,
     ) -> mcp_types.CallToolResult:
-        return invoke_catalogue_tool(
-            active_catalogue,
+        return call_catalogue(
             "list_campaigns",
             _without_empty_values(
                 {
@@ -325,19 +389,20 @@ def build_mcp_server(
 
     @server.tool(
         name="get_campaign_details",
+        title="Get Google Ads Campaign Details",
         description="Return details for one campaign in an explicitly allow-listed customer.",
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         meta=OAUTH_TOOL_META if oauth_server is not None else None,
     )
     def get_campaign_details(customer_id: str, campaign_id: int) -> mcp_types.CallToolResult:
-        return invoke_catalogue_tool(
-            active_catalogue,
+        return call_catalogue(
             "get_campaign_details",
             {"customer_id": customer_id, "campaign_id": campaign_id},
         )
 
     @server.tool(
         name="get_campaign_cost",
+        title="Get Google Ads Campaign Cost",
         description="Return daily campaign cost rows for an explicitly allow-listed customer.",
         annotations=READ_ONLY_TOOL_ANNOTATIONS,
         meta=OAUTH_TOOL_META if oauth_server is not None else None,
@@ -349,8 +414,7 @@ def build_mcp_server(
         status: str | None = None,
         campaign_ids: list[int] | None = None,
     ) -> mcp_types.CallToolResult:
-        return invoke_catalogue_tool(
-            active_catalogue,
+        return call_catalogue(
             "get_campaign_cost",
             _without_empty_values(
                 {
@@ -365,6 +429,7 @@ def build_mcp_server(
 
     @server.tool(
         name="get_campaign_performance",
+        title="Get Google Ads Campaign Performance",
         description=(
             "Return campaign performance rows for one or more explicitly allow-listed customers."
         ),
@@ -379,8 +444,7 @@ def build_mcp_server(
         status: str | None = None,
         campaign_ids: list[int] | None = None,
     ) -> mcp_types.CallToolResult:
-        return invoke_catalogue_tool(
-            active_catalogue,
+        return call_catalogue(
             "get_campaign_performance",
             _without_empty_values(
                 {
@@ -403,6 +467,7 @@ def build_mcp_server(
 def build_streamable_http_app(
     server: MCPServer,
     settings: McpRuntimeSettings,
+    oauth_server: McpOAuthServer | None = None,
 ) -> ASGIApp:
     """Build the SDK Streamable HTTP app with optional transport-level auth."""
 
@@ -414,9 +479,12 @@ def build_streamable_http_app(
     )
     if settings.auth_mode == STATIC_BEARER_AUTH_MODE and settings.auth_token:
         app = BearerTokenAuthMiddleware(app, settings.auth_token)
-    if settings.auth_mode == OAUTH_AUTH_MODE:
-        app = OAuthChallengeScopeMiddleware(app, READ_SCOPE)
-    return HostOriginSecurityMiddleware(app, transport_security)
+    if settings.auth_mode == OAUTH_AUTH_MODE and oauth_server is not None:
+        app = OptionalOAuthContextMiddleware(app, oauth_server)
+    app = HostOriginSecurityMiddleware(app, transport_security)
+    if settings.http_diagnostics:
+        app = HttpDiagnosticsMiddleware(app)
+    return app
 
 
 def _oauth_server_for_runtime(settings: McpRuntimeSettings) -> McpOAuthServer | None:
@@ -433,21 +501,24 @@ def _oauth_server_for_runtime(settings: McpRuntimeSettings) -> McpOAuthServer | 
 def run_streamable_http_server(
     server: MCPServer,
     settings: McpRuntimeSettings,
+    *,
+    oauth_server: McpOAuthServer | None = None,
 ) -> None:
     """Run the SDK Streamable HTTP transport."""
 
     import anyio
 
-    anyio.run(run_streamable_http_server_async, server, settings)
+    anyio.run(run_streamable_http_server_async, server, settings, oauth_server)
 
 
 async def run_streamable_http_server_async(
     server: MCPServer,
     settings: McpRuntimeSettings,
+    oauth_server: McpOAuthServer | None = None,
 ) -> None:
     import uvicorn
 
-    app = build_streamable_http_app(server, settings)
+    app = build_streamable_http_app(server, settings, oauth_server=oauth_server)
     config = uvicorn.Config(
         app,
         host=settings.host,
@@ -472,6 +543,90 @@ def invoke_catalogue_tool(
         ],
         structured_content=envelope,
         is_error=not bool(envelope.get("success")),
+    )
+
+
+def invoke_authorized_catalogue_tool(
+    catalogue: GoogleAdsFunctionCatalogue,
+    oauth_server: McpOAuthServer | None,
+    function_name: str,
+    params: Mapping[str, Any],
+) -> mcp_types.CallToolResult:
+    if oauth_server is None:
+        return invoke_catalogue_tool(catalogue, function_name, params)
+
+    access_token = get_access_token()
+    if access_token is None:
+        return _oauth_tool_auth_error(
+            oauth_server,
+            function_name,
+            error="invalid_token",
+            description="OAuth authentication is required to call Google Ads tools.",
+        )
+    if READ_SCOPE not in access_token.scopes:
+        return _oauth_tool_auth_error(
+            oauth_server,
+            function_name,
+            error="insufficient_scope",
+            description=f"The OAuth access token must include the {READ_SCOPE} scope.",
+        )
+    if access_token.resource != oauth_server.settings.resource_url:
+        return _oauth_tool_auth_error(
+            oauth_server,
+            function_name,
+            error="invalid_token",
+            description="The OAuth access token is not valid for this MCP resource.",
+        )
+
+    return invoke_catalogue_tool(catalogue, function_name, params)
+
+
+def _oauth_tool_auth_error(
+    oauth_server: McpOAuthServer,
+    function_name: str,
+    *,
+    error: str,
+    description: str,
+) -> mcp_types.CallToolResult:
+    envelope = {
+        "success": False,
+        "function": function_name,
+        "request_id": None,
+        "data": {},
+        "meta": {"customer_ids": [], "currency_codes": [], "row_count": 0},
+        "error": {
+            "category": "authorization",
+            "code": error,
+            "message": description,
+            "retryable": False,
+        },
+    }
+    challenge = _oauth_www_authenticate_challenge(
+        oauth_server,
+        error=error,
+        description=description,
+    )
+    return mcp_types.CallToolResult(
+        content=[
+            mcp_types.TextContent(
+                text=json.dumps(envelope, sort_keys=True, default=str),
+            )
+        ],
+        structured_content=envelope,
+        is_error=True,
+        _meta={"mcp/www_authenticate": [challenge]},
+    )
+
+
+def _oauth_www_authenticate_challenge(
+    oauth_server: McpOAuthServer,
+    *,
+    error: str,
+    description: str,
+) -> str:
+    return (
+        f'Bearer resource_metadata="{oauth_server.settings.protected_resource_metadata_url}", '
+        f'error="{error}", error_description="{description}", scope="{READ_SCOPE}"'
     )
 
 
@@ -510,6 +665,13 @@ def _auth_mode_from_env() -> str:
             code="unsupported_mcp_auth_mode",
         )
     return auth_mode
+
+
+def _bool_from_env(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def build_transport_security_settings(
@@ -599,6 +761,36 @@ def _header_value(scope: Scope, name: bytes) -> bytes | None:
         if key.lower() == name:
             return value
     return None
+
+
+def _bearer_token_from_scope(scope: Scope) -> str | None:
+    authorization = _header_value(scope, b"authorization")
+    if not authorization:
+        return None
+    marker = b"bearer "
+    if not authorization.lower().startswith(marker):
+        return None
+    token = authorization[len(marker) :].decode(errors="ignore").strip()
+    return token or None
+
+
+def _mcp_diagnostic_fields(body: bytes) -> tuple[str | None, str | int | None]:
+    if not body:
+        return None, None
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+
+    method = payload.get("method")
+    request_id = payload.get("id")
+    if not isinstance(method, str):
+        method = None
+    if not isinstance(request_id, (str, int)):
+        request_id = None
+    return method, request_id
 
 
 async def _send_auth_error(send: Send) -> None:

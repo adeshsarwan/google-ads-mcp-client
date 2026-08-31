@@ -375,8 +375,9 @@ class McpOAuthTests(unittest.TestCase):
         self.assertEqual(revoked_reuse.status_code, 400)
         self.assertEqual(revoked_reuse.json()["error"], "invalid_grant")
 
-    def test_mcp_endpoint_requires_oauth_scope_and_keeps_host_protection(self) -> None:
-        app, oauth_server, _ = self._build_oauth_app()
+    def test_mcp_discovery_is_anonymous_but_tool_calls_require_oauth(self) -> None:
+        catalogue = _FakeCatalogue(_success_response("list_accounts", []))
+        app, oauth_server, _ = self._build_oauth_app(catalogue)
         valid_token = oauth_server.issue_test_token(
             client_id="unit-client",
             scopes=[READ_SCOPE],
@@ -388,29 +389,109 @@ class McpOAuthTests(unittest.TestCase):
 
         with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
             missing = _initialize_mcp(client)
-            invalid = _initialize_mcp(client, authorization="Bearer wrong-token")
-            wrong_scope = _initialize_mcp(
+            session_id = missing.headers["mcp-session-id"]
+            initialized = _mcp_request(
                 client,
-                authorization=f"Bearer {wrong_scope_token}",
+                "",
+                session_id,
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
             )
-            valid = _initialize_mcp(client, authorization=f"Bearer {valid_token}")
+            tools = _mcp_request(
+                client,
+                "",
+                session_id,
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            )
+            missing_token_call = _mcp_request(
+                client,
+                "",
+                session_id,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "list_accounts", "arguments": {}},
+                },
+            )
+            invalid_token_call = _mcp_request(
+                client,
+                "",
+                session_id,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "list_accounts", "arguments": {}},
+                },
+                authorization="Bearer wrong-token",
+            )
+            wrong_scope_call = _mcp_request(
+                client,
+                wrong_scope_token,
+                session_id,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {"name": "list_accounts", "arguments": {}},
+                },
+            )
+            valid = _mcp_request(
+                client,
+                valid_token,
+                session_id,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {"name": "list_accounts", "arguments": {}},
+                },
+            )
             invalid_host = _initialize_mcp(
                 client,
                 authorization=f"Bearer {valid_token}",
                 host="attacker.example.com",
             )
 
-        self.assertEqual(missing.status_code, 401)
-        self.assertEqual(invalid.status_code, 401)
-        self.assertNotIn("wrong-token", invalid.text)
-        missing_challenge = missing.headers["WWW-Authenticate"]
-        self.assertIn("Bearer", missing_challenge)
-        self.assertIn('resource_metadata="', missing_challenge)
-        self.assertIn(f'scope="{READ_SCOPE}"', missing_challenge)
-        self.assertEqual(wrong_scope.status_code, 403)
-        self.assertIn("insufficient_scope", wrong_scope.headers["WWW-Authenticate"])
-        self.assertIn(f'scope="{READ_SCOPE}"', wrong_scope.headers["WWW-Authenticate"])
+        self.assertEqual(missing.status_code, 200)
+        self.assertEqual(initialized.status_code, 202)
+        self.assertEqual(tools.status_code, 200)
+        tool_body = _sse_json(tools)
+        tool_names = sorted(tool["name"] for tool in tool_body["result"]["tools"])
+        self.assertEqual(tool_names, EXPECTED_TOOLS)
+        for tool in tool_body["result"]["tools"]:
+            self.assertIsInstance(tool["title"], str)
+            self.assertTrue(tool["title"])
+            self.assertEqual(
+                tool["_meta"]["securitySchemes"],
+                [{"type": "oauth2", "scopes": [READ_SCOPE]}],
+            )
+
+        for response in (missing_token_call, invalid_token_call, wrong_scope_call):
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn("wrong-token", response.text)
+            body = _sse_json(response)
+            self.assertTrue(body["result"]["isError"])
+            challenge = body["result"]["_meta"]["mcp/www_authenticate"][0]
+            self.assertIn("Bearer", challenge)
+            self.assertIn('resource_metadata="', challenge)
+            self.assertIn(f'scope="{READ_SCOPE}"', challenge)
+
+        self.assertEqual(
+            _sse_json(missing_token_call)["result"]["structuredContent"]["error"]["code"],
+            "invalid_token",
+        )
+        self.assertEqual(
+            _sse_json(invalid_token_call)["result"]["structuredContent"]["error"]["code"],
+            "invalid_token",
+        )
+        self.assertEqual(
+            _sse_json(wrong_scope_call)["result"]["structuredContent"]["error"]["code"],
+            "insufficient_scope",
+        )
         self.assertEqual(valid.status_code, 200)
+        self.assertFalse(_sse_json(valid)["result"]["isError"])
+        self.assertEqual(catalogue.calls, [("list_accounts", {})])
         self.assertEqual(invalid_host.status_code, 421)
 
     def test_http_oauth_tools_list_and_call_use_existing_catalogue(self) -> None:
@@ -454,6 +535,8 @@ class McpOAuthTests(unittest.TestCase):
         tool_names = sorted(tool["name"] for tool in tool_body["result"]["tools"])
         self.assertEqual(tool_names, EXPECTED_TOOLS)
         for tool in tool_body["result"]["tools"]:
+            self.assertIsInstance(tool["title"], str)
+            self.assertTrue(tool["title"])
             self.assertEqual(
                 tool["_meta"]["securitySchemes"],
                 [{"type": "oauth2", "scopes": [READ_SCOPE]}],
@@ -547,6 +630,7 @@ class McpOAuthTests(unittest.TestCase):
                 public_origin=PUBLIC_ORIGIN,
                 auth_mode=OAUTH_AUTH_MODE,
             ),
+            oauth_server=oauth_server,
         )
 
 

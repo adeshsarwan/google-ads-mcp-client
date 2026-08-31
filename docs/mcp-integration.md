@@ -79,6 +79,7 @@ GOOGLE_ADS_MCP_OAUTH_SECRET=replace-with-at-least-32-random-chars
 GOOGLE_ADS_MCP_ACCESS_TOKEN_TTL_SECONDS=3600
 GOOGLE_ADS_MCP_AUTH_CODE_TTL_SECONDS=300
 GOOGLE_ADS_MCP_REFRESH_TOKEN_TTL_SECONDS=2592000
+GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=0
 ```
 
 Generate the owner password hash with Argon2id:
@@ -106,6 +107,10 @@ Supported OAuth behavior:
 - authorization server metadata at `/.well-known/oauth-authorization-server`
 - MCP resource scope `google_ads.read`
 - optional `offline_access` for refresh tokens
+- anonymous `initialize`, `notifications/initialized`, and `tools/list` for
+  ChatGPT action scanning
+- OAuth-protected `tools/call` execution using `_meta["mcp/www_authenticate"]`
+  challenges when a token is missing, invalid, or under-scoped
 
 Unsupported OAuth behavior:
 
@@ -118,6 +123,12 @@ The owner approval flow uses server-hosted login and approval pages. The owner
 password is never stored in plaintext; `.env` must contain only the Argon2id hash.
 OAuth tokens, authorization codes, owner sessions, and confidential-client secrets
 are stored hashed in SQLite.
+
+This mixed-auth behavior is deliberate. ChatGPT Business Custom Apps scan MCP
+tool descriptors before the owner OAuth login has occurred, so the six read-only
+tool definitions must be visible without exposing Google Ads data. Google Ads
+catalogue execution still requires a valid MCP OAuth token and preserves the
+existing customer allow-list.
 
 ## Static Bearer Fallback
 
@@ -155,8 +166,10 @@ curl -i http://127.0.0.1:8000/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-smoke","version":"0"}}}'
 ```
 
-For OAuth mode, an unauthenticated request should return `401` and a
-`WWW-Authenticate` challenge containing OAuth protected-resource metadata:
+For OAuth mode, unauthenticated `initialize` and `tools/list` are allowed so
+ChatGPT can import actions before owner OAuth. An unauthenticated `tools/call`
+returns a normal MCP response with `isError=true` plus
+`_meta["mcp/www_authenticate"]` so the client can start OAuth:
 
 ```bash
 curl -i https://googleads-mcp.thebesads.com/mcp \
@@ -213,6 +226,10 @@ Configure ChatGPT Business Custom Apps with:
 Dynamic client registration is enabled so ChatGPT can register its exact redirect
 URI and complete account linking with PKCE S256.
 
+The ChatGPT action scan should show the same six tools even before owner login:
+`list_accounts`, `get_account_details`, `list_campaigns`,
+`get_campaign_details`, `get_campaign_cost`, and `get_campaign_performance`.
+
 ChatGPT will discover:
 
 ```text
@@ -253,6 +270,7 @@ GOOGLE_ADS_MCP_OAUTH_DB=/var/lib/google-ads-mcp/oauth.db
 GOOGLE_ADS_MCP_OWNER_USERNAME=replace-me
 GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH=replace-with-argon2id-hash
 GOOGLE_ADS_MCP_OAUTH_SECRET=replace-with-at-least-32-random-chars
+GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=0
 ```
 
 Public port `8010` must remain closed. Cloudflare Tunnel should map:
@@ -291,3 +309,8 @@ sudo systemctl restart google-ads-mcp
 ## Logging
 
 Stdio stdout is reserved for JSON-RPC protocol messages. Streamable HTTP responses are MCP protocol responses. Operational logs go to stderr and must not include Google Ads credentials, OAuth secrets, refresh tokens, or MCP bearer tokens.
+
+For short diagnostic windows, set `GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=1` and restart
+the service. The diagnostic log contains only path, HTTP status, MCP method,
+request id, and duration; it does not log Authorization headers, OAuth tokens,
+Google Ads credentials, request parameters, or response data.

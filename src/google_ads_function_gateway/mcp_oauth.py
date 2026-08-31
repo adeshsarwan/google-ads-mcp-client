@@ -154,8 +154,13 @@ class McpOAuthSettings:
     @property
     def protected_resource_metadata_url(self) -> str:
         parsed = urlparse(self.resource_url)
+        return f"{parsed.scheme}://{parsed.netloc}{self.protected_resource_metadata_path}"
+
+    @property
+    def protected_resource_metadata_path(self) -> str:
+        parsed = urlparse(self.resource_url)
         resource_path = parsed.path if parsed.path != "/" else ""
-        return f"{parsed.scheme}://{parsed.netloc}{PROTECTED_RESOURCE_METADATA_PATH}{resource_path}"
+        return f"{PROTECTED_RESOURCE_METADATA_PATH}{resource_path}"
 
 
 @dataclass(frozen=True)
@@ -719,11 +724,17 @@ class McpOAuthServer(TokenVerifier):
             methods=["GET", "OPTIONS"],
             include_in_schema=False,
         )(self.authorization_server_metadata)
-        server.custom_route(
-            PROTECTED_RESOURCE_METADATA_PATH,
-            methods=["GET", "OPTIONS"],
-            include_in_schema=False,
-        )(self.protected_resource_metadata)
+        for metadata_path in dict.fromkeys(
+            (
+                PROTECTED_RESOURCE_METADATA_PATH,
+                self.settings.protected_resource_metadata_path,
+            )
+        ):
+            server.custom_route(
+                metadata_path,
+                methods=["GET", "OPTIONS"],
+                include_in_schema=False,
+            )(self.protected_resource_metadata)
         server.custom_route(
             AUTHORIZATION_PATH,
             methods=["GET", "POST"],

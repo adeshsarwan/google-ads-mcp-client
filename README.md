@@ -181,6 +181,7 @@ GOOGLE_ADS_MCP_OAUTH_SECRET=replace-with-at-least-32-random-chars
 GOOGLE_ADS_MCP_ACCESS_TOKEN_TTL_SECONDS=3600
 GOOGLE_ADS_MCP_AUTH_CODE_TTL_SECONDS=300
 GOOGLE_ADS_MCP_REFRESH_TOKEN_TTL_SECONDS=2592000
+GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=0
 ```
 
 Generate the owner password hash locally without printing the plaintext password:
@@ -228,6 +229,14 @@ google_ads.read
 
 `offline_access` may be requested when the client needs refresh tokens.
 
+OAuth mode is intentionally ChatGPT-compatible mixed authentication. The MCP
+`initialize`, `notifications/initialized`, and `tools/list` protocol messages can
+run without an access token so ChatGPT can scan and publish the six tool
+descriptors before the owner completes OAuth. Every `tools/call` for the Google
+Ads catalogue still requires a valid MCP OAuth access token with `google_ads.read`;
+missing, invalid, or under-scoped tokens return an MCP auth challenge via
+`_meta["mcp/www_authenticate"]` and do not execute Google Ads code.
+
 OAuth owner approval happens on server-hosted login and approval pages. The password
 stored in `.env` must be an Argon2id hash in `GOOGLE_ADS_MCP_OWNER_PASSWORD_HASH`;
 do not put a plaintext owner password in `.env`.
@@ -272,6 +281,11 @@ Google Ads credentials stay server-side and are never provided to ChatGPT. If yo
 
 MCP stdio reserves stdout for JSON-RPC protocol messages. The MCP entrypoint does not print banners or debug output, and operational logging is configured for stderr.
 
+Set `GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=1` only when diagnosing remote MCP
+connectivity. It logs secret-free request facts such as path, HTTP status, MCP
+method, request id, and duration to stderr; it never logs Authorization headers,
+OAuth tokens, Google Ads credentials, request parameters, or response data.
+
 ### Tunnel Compatibility
 
 The Streamable HTTP server is designed to sit behind a standard HTTPS reverse proxy or secure tunnel. Keep the local server bound to `127.0.0.1`, expose the MCP and OAuth paths over HTTPS, and ensure the proxy forwards request bodies and MCP headers unchanged. The application does not depend on a specific tunnel vendor.
@@ -303,6 +317,10 @@ refresh token, or any other server-side Google Ads credential.
 Dynamic client registration is enabled so ChatGPT can register its exact redirect
 URI and use PKCE S256 during account linking.
 
+When the ChatGPT Business app scans actions, it should be able to import the same
+six tools before the owner OAuth login happens. OAuth is enforced when ChatGPT or
+another MCP client calls a tool, not when it lists tool descriptors.
+
 ## Configuration
 
 Supported environment variables:
@@ -328,6 +346,7 @@ Supported environment variables:
 - `GOOGLE_ADS_MCP_AUTH_CODE_TTL_SECONDS` OAuth authorization-code lifetime, default `300`
 - `GOOGLE_ADS_MCP_REFRESH_TOKEN_TTL_SECONDS` OAuth refresh-token lifetime, default `2592000`
 - `GOOGLE_ADS_MCP_OAUTH_SECRET` server-side HMAC secret for hashing OAuth tokens, authorization codes, client secrets, and owner sessions at rest
+- `GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS` optional secret-free Streamable HTTP diagnostic logging, default `0`
 - `GOOGLE_ADS_MCP_AUTH_TOKEN` optional bearer token used only when `GOOGLE_ADS_MCP_AUTH_MODE=static_bearer`
 
 ## Development Checks

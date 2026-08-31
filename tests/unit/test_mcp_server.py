@@ -105,6 +105,19 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(settings.public_host, "googleads-mcp.thebesads.com")
         self.assertEqual(settings.auth_mode, STATIC_BEARER_AUTH_MODE)
         self.assertEqual(settings.endpoint_url, "http://127.0.0.1:8765/mcp")
+        self.assertIsNone(run_http.call_args.kwargs["oauth_server"])
+
+    def test_runtime_settings_enable_opt_in_http_diagnostics(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS": "1",
+                "GOOGLE_ADS_MCP_AUTH_MODE": STATIC_BEARER_AUTH_MODE,
+            },
+        ):
+            settings = McpRuntimeSettings.from_env(transport="streamable-http")
+
+        self.assertTrue(settings.http_diagnostics)
 
     def test_transport_security_settings_allow_localhost_and_public_host(self) -> None:
         settings = build_transport_security_settings(
@@ -270,6 +283,30 @@ class McpServerTests(unittest.TestCase):
         self.assertNotEqual(valid.status_code, 421)
         self.assertEqual(invalid_host.status_code, 421)
 
+    def test_http_diagnostics_log_mcp_method_without_authorization_value(self) -> None:
+        app = _http_mcp_app(
+            public_host="googleads-mcp.thebesads.com",
+            port=8010,
+            auth_token="secret-token",
+            http_diagnostics=True,
+        )
+
+        with TestClient(app) as client, self.assertLogs(
+            "google_ads_function_gateway.mcp_server",
+            level="WARNING",
+        ) as logs:
+            response = _initialize_mcp(
+                client,
+                host="googleads-mcp.thebesads.com",
+                authorization="Bearer secret-token",
+            )
+
+        joined = "\n".join(logs.output)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"event": "mcp_http_request"', joined)
+        self.assertIn('"mcp_method": "initialize"', joined)
+        self.assertNotIn("secret-token", joined)
+
     def test_http_auth_rejects_missing_or_invalid_bearer_token(self) -> None:
         app = BearerTokenAuthMiddleware(_plain_text_app(), "expected-token")
 
@@ -429,6 +466,7 @@ def _http_mcp_app(
     public_host: str | None = None,
     port: int = 8000,
     auth_token: str | None = None,
+    http_diagnostics: bool = False,
 ) -> object:
     with patch("google_ads_function_gateway.mcp_server.load_local_env"):
         server = build_mcp_server(_FakeCatalogue(_success_response("list_accounts", [])))
@@ -441,6 +479,7 @@ def _http_mcp_app(
             auth_token=auth_token,
             public_host=public_host,
             auth_mode=STATIC_BEARER_AUTH_MODE,
+            http_diagnostics=http_diagnostics,
         ),
     )
 
