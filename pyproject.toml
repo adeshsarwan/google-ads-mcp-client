@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google-ads-function-gateway"
+version = "0.1.0"
+description = "Deterministic Google Ads function gateway for approved read-only catalogue functions."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Google Ads MCP Client maintainers" }]
+dependencies = []
+
+[project.optional-dependencies]
+google-ads = ["google-ads"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
