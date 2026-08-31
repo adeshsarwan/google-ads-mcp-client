@@ -311,6 +311,9 @@ sudo systemctl restart google-ads-mcp
 Stdio stdout is reserved for JSON-RPC protocol messages. Streamable HTTP responses are MCP protocol responses. Operational logs go to stderr and must not include Google Ads credentials, OAuth secrets, refresh tokens, or MCP bearer tokens.
 
 For short diagnostic windows, set `GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=1` and restart
-the service. The diagnostic log contains only path, HTTP status, MCP method,
-request id, and duration; it does not log Authorization headers, OAuth tokens,
-Google Ads credentials, request parameters, or response data.
+the service. The diagnostic log contains only safe request metadata: path, HTTP
+status, Content-Type, Accept, User-Agent, Content-Length, MCP session/protocol
+header presence, MCP method header, JSON top-level type, JSON-RPC version,
+JSON-RPC id type, parse-failure category, and duration. It does not log
+Authorization header values, cookies, OAuth tokens, Google Ads credentials,
+request parameters, or response data.

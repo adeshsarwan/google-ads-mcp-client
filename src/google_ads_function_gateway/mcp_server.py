@@ -222,7 +222,7 @@ class HttpDiagnosticsMiddleware:
         body = b"".join(
             message.get("body", b"") for message in messages if message["type"] == "http.request"
         )
-        mcp_method, request_id = _mcp_diagnostic_fields(body)
+        diagnostic_fields = _mcp_diagnostic_fields(scope, body)
 
         async def replay_receive() -> Message:
             if messages:
@@ -245,10 +245,9 @@ class HttpDiagnosticsMiddleware:
                         "duration_ms": duration_ms,
                         "event": "mcp_http_request",
                         "method": scope.get("method"),
-                        "mcp_method": mcp_method,
                         "path": scope.get("path"),
-                        "request_id": request_id,
                         "status": status_code,
+                        **diagnostic_fields,
                     },
                     sort_keys=True,
                 )
@@ -774,23 +773,94 @@ def _bearer_token_from_scope(scope: Scope) -> str | None:
     return token or None
 
 
-def _mcp_diagnostic_fields(body: bytes) -> tuple[str | None, str | int | None]:
+def _mcp_diagnostic_fields(scope: Scope, body: bytes) -> dict[str, Any]:
+    headers = _diagnostic_headers(scope)
+    fields: dict[str, Any] = {
+        "accept": _truncate_header(headers.get("accept")),
+        "authorization_present": "authorization" in headers,
+        "body_bytes": len(body),
+        "content_length": _truncate_header(headers.get("content-length")),
+        "content_type": _truncate_header(headers.get("content-type")),
+        "json_top_level_type": None,
+        "jsonrpc_id_type": None,
+        "jsonrpc_version": None,
+        "mcp_method": None,
+        "mcp_method_header": _truncate_header(headers.get("mcp-method")),
+        "mcp_protocol_version": _truncate_header(headers.get("mcp-protocol-version")),
+        "mcp_protocol_version_present": "mcp-protocol-version" in headers,
+        "mcp_session_id_present": "mcp-session-id" in headers,
+        "origin_hostname": _origin_hostname(headers.get("origin")),
+        "origin_present": "origin" in headers,
+        "parse_failure": None,
+        "user_agent": _truncate_header(headers.get("user-agent")),
+    }
     if not body:
-        return None, None
+        fields["parse_failure"] = "empty_body"
+        return fields
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
-        return None, None
+        fields["parse_failure"] = "invalid_json"
+        return fields
+
+    fields["json_top_level_type"] = _json_type_name(payload)
     if not isinstance(payload, dict):
-        return None, None
+        fields["parse_failure"] = "json_top_level_not_object"
+        return fields
 
     method = payload.get("method")
-    request_id = payload.get("id")
-    if not isinstance(method, str):
-        method = None
-    if not isinstance(request_id, (str, int)):
-        request_id = None
-    return method, request_id
+    jsonrpc_version = payload.get("jsonrpc")
+    if isinstance(method, str):
+        fields["mcp_method"] = method
+    elif "method" not in payload:
+        fields["parse_failure"] = "missing_method"
+    else:
+        fields["parse_failure"] = "invalid_method_type"
+    if isinstance(jsonrpc_version, str):
+        fields["jsonrpc_version"] = jsonrpc_version
+    if "id" in payload:
+        fields["jsonrpc_id_type"] = _json_type_name(payload["id"])
+    return fields
+
+
+def _diagnostic_headers(scope: Scope) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for key, value in scope.get("headers", []):
+        header_name = key.decode("latin-1").lower()
+        if header_name in {"authorization", "cookie", "set-cookie"}:
+            headers[header_name] = ""
+            continue
+        headers[header_name] = value.decode("latin-1", errors="replace")
+    return headers
+
+
+def _truncate_header(value: str | None, *, max_length: int = 200) -> str | None:
+    if value is None:
+        return None
+    return value[:max_length]
+
+
+def _origin_hostname(origin: str | None) -> str | None:
+    if not origin:
+        return None
+    parsed = urlparse(origin)
+    return parsed.hostname
+
+
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int | float):
+        return "number"
+    return type(value).__name__
 
 
 async def _send_auth_error(send: Send) -> None:

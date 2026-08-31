@@ -282,9 +282,12 @@ Google Ads credentials stay server-side and are never provided to ChatGPT. If yo
 MCP stdio reserves stdout for JSON-RPC protocol messages. The MCP entrypoint does not print banners or debug output, and operational logging is configured for stderr.
 
 Set `GOOGLE_ADS_MCP_HTTP_DIAGNOSTICS=1` only when diagnosing remote MCP
-connectivity. It logs secret-free request facts such as path, HTTP status, MCP
-method, request id, and duration to stderr; it never logs Authorization headers,
-OAuth tokens, Google Ads credentials, request parameters, or response data.
+connectivity. It logs secret-free request facts such as path, HTTP status,
+Content-Type, Accept, User-Agent, Content-Length, MCP session/protocol header
+presence, MCP method header, JSON top-level type, JSON-RPC version, JSON-RPC id
+type, parse-failure category, and duration to stderr. It never logs
+Authorization header values, cookies, OAuth tokens, Google Ads credentials,
+request parameters, or response data.
 
 ### Tunnel Compatibility
 

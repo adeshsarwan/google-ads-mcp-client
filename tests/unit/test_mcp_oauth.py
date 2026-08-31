@@ -547,6 +547,110 @@ class McpOAuthTests(unittest.TestCase):
         self.assertEqual(call_body["result"]["structuredContent"]["function"], "list_accounts")
         self.assertEqual(catalogue.calls, [("list_accounts", {})])
 
+    def test_chatgpt_action_discovery_initial_post_compatibility_variants(self) -> None:
+        app, _, _ = self._build_oauth_app()
+        initialize_body = _initialize_payload()
+        modern_meta = {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {"name": "unit-test", "version": "0"},
+        }
+        modern_discover_body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {"_meta": modern_meta},
+        }
+
+        variants = [
+            (
+                "accept_both",
+                {"Accept": "application/json, text/event-stream"},
+                initialize_body,
+                200,
+            ),
+            ("accept_json_only", {"Accept": "application/json"}, initialize_body, 406),
+            ("accept_sse_only", {"Accept": "text/event-stream"}, initialize_body, 406),
+            ("accept_wildcard", {"Accept": "*/*"}, initialize_body, 200),
+            (
+                "no_protocol_header",
+                {"Accept": "application/json, text/event-stream"},
+                initialize_body,
+                200,
+            ),
+            (
+                "protocol_2025_06_18",
+                {
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-06-18",
+                },
+                initialize_body,
+                200,
+            ),
+            (
+                "legacy_initialize_with_current_protocol_header",
+                {
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2026-07-28",
+                },
+                initialize_body,
+                400,
+            ),
+            (
+                "modern_server_discover",
+                {
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "Mcp-Method": "server/discover",
+                },
+                modern_discover_body,
+                200,
+            ),
+            (
+                "no_session_id_initial",
+                {"Accept": "application/json, text/event-stream"},
+                initialize_body,
+                200,
+            ),
+            (
+                "chatgpt_user_agent",
+                {"Accept": "application/json, text/event-stream", "User-Agent": "ChatGPT-User/1.0"},
+                initialize_body,
+                200,
+            ),
+            (
+                "origin_absent",
+                {"Accept": "application/json, text/event-stream"},
+                initialize_body,
+                200,
+            ),
+            (
+                "chatgpt_origin",
+                {"Accept": "application/json, text/event-stream", "Origin": "https://chatgpt.com"},
+                initialize_body,
+                403,
+            ),
+        ]
+
+        with TestClient(app, base_url=PUBLIC_ORIGIN) as client:
+            statuses = {
+                name: client.post(
+                    "/mcp",
+                    headers={
+                        "Host": PUBLIC_HOST,
+                        "Content-Type": "application/json",
+                        **headers,
+                    },
+                    json=body,
+                ).status_code
+                for name, headers, body, _ in variants
+            }
+
+        self.assertEqual(
+            statuses,
+            {name: expected_status for name, _, _, expected_status in variants},
+        )
+
     def test_oauth_env_configuration_defaults_for_remote_http(self) -> None:
         env = {
             "GOOGLE_ADS_MCP_PUBLIC_HOST": PUBLIC_HOST,
@@ -792,6 +896,19 @@ def _initialize_mcp(
         authorization=authorization,
         host=host,
     )
+
+
+def _initialize_payload() -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "unit-test", "version": "0"},
+        },
+    }
 
 
 def _mcp_request(

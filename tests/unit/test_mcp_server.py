@@ -305,6 +305,89 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('"event": "mcp_http_request"', joined)
         self.assertIn('"mcp_method": "initialize"', joined)
+        self.assertIn('"authorization_present": true', joined)
+        self.assertIn('"content_type": "application/json"', joined)
+        self.assertIn('"json_top_level_type": "object"', joined)
+        self.assertIn('"jsonrpc_id_type": "number"', joined)
+        self.assertIn('"jsonrpc_version": "2.0"', joined)
+        self.assertIn('"mcp_protocol_version_present": false', joined)
+        self.assertIn('"mcp_session_id_present": false', joined)
+        self.assertIn('"parse_failure": null', joined)
+        self.assertNotIn("secret-token", joined)
+
+    def test_http_diagnostics_classify_non_object_post_without_body_leak(self) -> None:
+        app = _http_mcp_app(
+            public_host="googleads-mcp.thebesads.com",
+            port=8010,
+            auth_token="secret-token",
+            http_diagnostics=True,
+        )
+
+        with TestClient(app) as client, self.assertLogs(
+            "google_ads_function_gateway.mcp_server",
+            level="WARNING",
+        ) as logs:
+            response = client.post(
+                "/mcp",
+                headers={
+                    "Host": "googleads-mcp.thebesads.com",
+                    "Authorization": "Bearer secret-token",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "User-Agent": "ChatGPT-User/1.0",
+                },
+                json=[
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {"name": "unit-test", "version": "0"},
+                        },
+                    }
+                ],
+            )
+
+        joined = "\n".join(logs.output)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('"json_top_level_type": "array"', joined)
+        self.assertIn('"parse_failure": "json_top_level_not_object"', joined)
+        self.assertIn('"mcp_method": null', joined)
+        self.assertIn('"status": 400', joined)
+        self.assertIn('"user_agent": "ChatGPT-User/1.0"', joined)
+        self.assertNotIn("secret-token", joined)
+        self.assertNotIn('"method": "initialize"', joined)
+
+    def test_http_diagnostics_classify_empty_post(self) -> None:
+        app = _http_mcp_app(
+            public_host="googleads-mcp.thebesads.com",
+            port=8010,
+            auth_token="secret-token",
+            http_diagnostics=True,
+        )
+
+        with TestClient(app) as client, self.assertLogs(
+            "google_ads_function_gateway.mcp_server",
+            level="WARNING",
+        ) as logs:
+            response = client.post(
+                "/mcp",
+                headers={
+                    "Host": "googleads-mcp.thebesads.com",
+                    "Authorization": "Bearer secret-token",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
+                content=b"",
+            )
+
+        joined = "\n".join(logs.output)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('"body_bytes": 0', joined)
+        self.assertIn('"parse_failure": "empty_body"', joined)
+        self.assertIn('"mcp_method": null', joined)
         self.assertNotIn("secret-token", joined)
 
     def test_http_auth_rejects_missing_or_invalid_bearer_token(self) -> None:
